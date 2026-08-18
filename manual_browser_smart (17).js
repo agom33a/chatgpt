@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v7.9 - Focused signals)
+ *   🎯 ChatGPT Manual Browser Smart (v8.0 - Progress driven)
+ *
+ *   v8.0 additions:
+ *     - Waits on observed network progress instead of fixed deadlines
+ *     - Escalates exit-IP probe budgets so slow proxies still qualify
+ *     - Detects the plan/upgrade surface from the page, not from the URL
+ *     - Ignores the sidebar upgrade entry point that is always present
  *
  *   v7.9 additions:
  *     - Ignores third-party (ad/telemetry) transport failures
@@ -384,7 +390,7 @@ const TIMEZONE_TO_COUNTRY = {
 // tried first to keep probes fast.
 let preferredExitProvider = null;
 
-async function probeExitCountry(cdp, sessionId = null) {
+async function probeExitCountry(cdp, sessionId = null, perProviderTimeoutMs = 4000) {
   const startedAt = Date.now();
   try {
     const res = await cdp.send('Runtime.evaluate', {
@@ -403,7 +409,7 @@ async function probeExitCountry(cdp, sessionId = null) {
         }
         for (const provider of providers) {
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 2500);
+          const timer = setTimeout(() => controller.abort(), ${perProviderTimeoutMs});
           try {
             const joiner = provider.url.includes('?') ? '&' : '?';
             const response = await fetch(provider.url + joiner + '_=' + Date.now(), {
@@ -420,8 +426,8 @@ async function probeExitCountry(cdp, sessionId = null) {
         }
         return JSON.stringify({ok:false});
       })()`,
-      awaitPromise: true, returnByValue: true, timeout: 14000
-    }, sessionId);
+      awaitPromise: true, returnByValue: true, timeout: perProviderTimeoutMs * 4 + 6000
+    }, sessionId, perProviderTimeoutMs * 4 + 16000);
     const route = JSON.parse(res.result?.value || '{}');
     route.elapsedMs = Date.now() - startedAt;
     if (route.ok && route.provider) preferredExitProvider = route.provider;
@@ -495,47 +501,66 @@ async function detectCountry(cdp) {
   return null;
 }
 
-// ── Detect trial offer button in page ──
+// ── Detect trial offer or upgrade surface in the page ──
+// The plan surface is recognised from the page itself, not from the URL: after a
+// reload the pricing hash can be gone while the plan cards are still shown.
+const OFFER_DETECTION_EXPRESSION = `(() => {
+  try {
+    if (!document || !document.body) return JSON.stringify({found:false});
+
+    const visible = el => {
+      if (!el || el.offsetParent === null) return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const text = el => (el.textContent || '').replace(/\\s+/g, ' ').trim();
+
+    // Priority 1: an actual free-trial offer, which we want to skip.
+    const claimBtn = document.querySelector('button[aria-label="Claim offer"]');
+    if (visible(claimBtn)) return JSON.stringify({found:true, type:'trial', mode:'claim'});
+    const trialLabels = ['free offer', 'claim free offer', 'start free trial', 'try it free'];
+    const freeBtn = Array.from(document.querySelectorAll('button, a[role="button"]'))
+      .find(el => visible(el) && trialLabels.includes(text(el).toLowerCase()));
+    if (freeBtn) return JSON.stringify({found:true, type:'trial', mode:'free', buttonLabel: text(freeBtn)});
+
+    // Priority 2: an upgrade action, which means no trial is being offered.
+    const upgradeLabels = [
+      'upgrade to plus', 'get plus', 'rejoin plus', 'subscribe to plus',
+      'reactivate plus', 'go plus', 'upgrade to chatgpt plus', 'resubscribe to plus'
+    ];
+    const upgradeEl = Array.from(document.querySelectorAll('button, a[role="button"], a[href*="checkout"]'))
+      .find(el => visible(el) && upgradeLabels.includes(text(el).toLowerCase()));
+    if (!upgradeEl) return JSON.stringify({found:false});
+
+    // The sidebar always shows a generic upgrade entry point for free accounts,
+    // so a plan surface must be present before offering to build a pay link.
+    const urlSuggestsPricing = location.hash.includes('pricing') ||
+      location.pathname.includes('pricing') ||
+      location.search.includes('promo_campaign');
+
+    const inDialog = !!upgradeEl.closest('[role="dialog"], dialog');
+    const bodyText = text(document.body).toLowerCase();
+    const mentionsPlusPlan = bodyText.includes('chatgpt plus') || bodyText.includes('your ai assistant');
+    const showsMonthlyPrice = /\\/\\s*month|per month|\\/mo\\b/i.test(bodyText);
+    const planSurface = inDialog || (mentionsPlusPlan && showsMonthlyPrice);
+
+    if (!urlSuggestsPricing && !planSurface) {
+      return JSON.stringify({found:false, reason:'upgrade button without a plan surface'});
+    }
+
+    return JSON.stringify({
+      found: true,
+      type: 'noTrial',
+      buttonLabel: text(upgradeEl),
+      surface: urlSuggestsPricing ? 'pricing-url' : (inDialog ? 'plan-dialog' : 'plan-cards')
+    });
+  } catch (e) { return JSON.stringify({found:false, err:e.message}); }
+})()`;
+
 async function detectOffer(cdp) {
   try {
     const res = await cdp.send('Runtime.evaluate', {
-      expression: `(() => {
-        try {
-          if (!document || !document.body) return JSON.stringify({found:false});
-
-          // Priority 1: Trial offer buttons
-          const claimBtn = document.querySelector('button[aria-label="Claim offer"]');
-          if (claimBtn && claimBtn.offsetParent !== null) return JSON.stringify({found:true, type:'trial', mode:'claim'});
-          const freeBtn = Array.from(document.querySelectorAll('button')).find(b => {
-            const txt = (b.textContent || '').trim();
-            return (txt === 'Free offer' || txt === 'Claim free offer') && b.offsetParent !== null;
-          });
-          if (freeBtn) return JSON.stringify({found:true, type:'trial', mode:'free'});
-
-          // Priority 2: Pricing page without trial (various button labels)
-          // Covers: "Upgrade to Plus", "Get Plus", "Rejoin Plus", "Subscribe to Plus"
-          const isPricingPage = location.hash.includes('pricing') ||
-            location.pathname.includes('pricing') ||
-            location.search.includes('promo_campaign');
-          if (isPricingPage) {
-            const upgradeBtn = Array.from(document.querySelectorAll('button')).find(b => {
-              const txt = (b.textContent || '').trim().toLowerCase();
-              return (txt === 'upgrade to plus' ||
-                      txt === 'get plus' ||
-                      txt === 'rejoin plus' ||
-                      txt === 'subscribe to plus' ||
-                      txt === 'reactivate plus' ||
-                      txt === 'go plus') && b.offsetParent !== null;
-            });
-            if (upgradeBtn) {
-              const label = upgradeBtn.textContent.trim();
-              return JSON.stringify({found:true, type:'noTrial', buttonLabel: label});
-            }
-          }
-
-          return JSON.stringify({found:false});
-        } catch(e) { return JSON.stringify({found:false, err:e.message}); }
-      })()`,
+      expression: OFFER_DETECTION_EXPRESSION,
       returnByValue: true, timeout: 5000
     });
     return JSON.parse(res.result?.value || '{}');
@@ -821,7 +846,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v7.9 - Focused Signals)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v8.0 - Progress Driven)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -1002,7 +1027,9 @@ async function main() {
 
   console.log('\n  🚀 Opening Chrome...');
   const chrome = spawn(chromePath, args, { stdio: 'ignore' });
-  await sleep(3500);
+  // connectCDP polls for the debugging endpoint, so only a short pause is
+  // needed before handing over to that retry loop.
+  await sleep(800);
 
   let cleaning = false;
   const cleanup = () => {
@@ -1032,6 +1059,12 @@ async function main() {
   // Tracks whether the visible tab currently holds a real chatgpt.com document,
   // so in-page polling is skipped on error/blank pages.
   let pageIsChatGPT = false;
+  // Timestamp of the last ChatGPT network event. Waiting logic uses this so a
+  // slow but progressing connection is never abandoned on a clock alone.
+  let lastChatGPTActivityAt = Date.now();
+  const noteChatGPTActivity = url => {
+    if (/(^|\/\/|\.)chatgpt\.com(\/|$)/i.test(String(url || ''))) lastChatGPTActivityAt = Date.now();
+  };
 
   // Once the server has issued a session cookie it is authoritative; the jar is
   // only consulted while no server cookie has been seen yet.
@@ -1093,6 +1126,7 @@ async function main() {
   cdp.on('Network.requestWillBeSent', params => {
     const url = params.request?.url || '';
     const type = params.type || 'Other';
+    noteChatGPTActivity(url);
     inFlight.set(params.requestId, {
       url,
       type,
@@ -1128,6 +1162,7 @@ async function main() {
     const info = inFlight.get(params.requestId);
     const type = params.type || info?.type || 'Other';
     const response = params.response || {};
+    noteChatGPTActivity(response.url);
     const durationMs = info ? Date.now() - info.startedAt : null;
     const quiet = response.status < 400 &&
       ((isAsset(type) && !TRACE_ASSETS) || isTelemetryUrl(response.url));
@@ -1370,12 +1405,13 @@ async function main() {
 
   console.log('  🌐 Navigating to chatgpt.com...');
   await cdp.send('Page.navigate', { url: 'https://chatgpt.com/' });
-  await sleep(4000);
+  await waitForChatGPTDocument(3000, null, null, { idleGraceMs: 4000 });
 
-  // Verify login
+  // Verify login. Attempts continue while the connection keeps answering, so a
+  // slow proxy gets as many tries as it needs instead of a fixed five.
   let verifiedEmail = null;
   let initialCountry = null;
-  for (let i = 0; i < 5; i++) {
+  for (let attempt = 1; attempt <= 12 && (attempt <= 5 || Date.now() - lastChatGPTActivityAt < 15000); attempt++) {
     try {
       const res = await cdp.send('Runtime.evaluate', {
         expression: `Promise.all([
@@ -1387,8 +1423,8 @@ async function main() {
           hasToken:!!session?.accessToken,
           country:me?.country||null
         })).catch(e=>JSON.stringify({ok:false,err:e.message}))`,
-        awaitPromise: true, returnByValue: true, timeout: 10000
-      });
+        awaitPromise: true, returnByValue: true, timeout: 40000
+      }, null, 50000);
       const parsed = JSON.parse(res.result?.value || '{}');
       if (parsed.ok && parsed.hasToken) {
         verifiedEmail = parsed.email;
@@ -1486,8 +1522,8 @@ async function main() {
             snippet: session.snippet || me.snippet || null
           });
         })()`,
-        awaitPromise: true, returnByValue: true, timeout: 12000
-      }, sessionId);
+        awaitPromise: true, returnByValue: true, timeout: 45000
+      }, sessionId, 55000);
       return JSON.parse(res.result?.value || '{}');
     } catch (e) {
       return { status: 0, error: e.message };
@@ -1520,7 +1556,7 @@ async function main() {
   // Waits for a usable route. A changed exit country is preferred, but an
   // unchanged one still counts once the change window passes, so an auth-only
   // failure is not stuck waiting for a country that never changes.
-  async function waitForHealthyProxyRoute(previousCountry, timeoutMs = 45000, changeWindowMs = 6000) {
+  async function waitForHealthyProxyRoute(previousCountry, timeoutMs = 120000, changeWindowMs = 6000) {
     await ensureProbeableContext();
     const startedProbingAt = Date.now();
     const deadline = startedProbingAt + timeoutMs;
@@ -1530,7 +1566,10 @@ async function main() {
     while (Date.now() < deadline && cdp.isAlive() && !cleaning) {
       probeNumber++;
       setRecoveryState('probing-route');
-      const route = await probeExitCountry(cdp);
+      // Each attempt gives the route more time, so a genuinely slow proxy is
+      // not written off as unreachable.
+      const providerBudget = Math.min(4000 + (probeNumber - 1) * 3000, 20000);
+      const route = await probeExitCountry(cdp, null, providerBudget);
       const changed = route.ok && (!previousCountry || route.country !== previousCountry);
       trace('proxy_route_probe', {
         probeNumber,
@@ -1538,9 +1577,10 @@ async function main() {
         country: route.country || null,
         provider: route.provider || null,
         changed,
+        providerBudgetMs: providerBudget,
         elapsedMs: route.elapsedMs,
         error: route.error || null
-      }, `🛰️  route probe #${probeNumber} ${route.ok ? route.country : 'unreachable'}${route.ok && !changed ? ' (unchanged)' : ''} ${route.elapsedMs}ms`);
+      }, `🛰️  route probe #${probeNumber} ${route.ok ? route.country : `unreachable (budget ${providerBudget}ms)`}${route.ok && !changed ? ' (unchanged)' : ''} ${route.elapsedMs}ms`);
 
       if (changed) return { ...route, changed: true };
       if (route.ok) {
@@ -1559,11 +1599,26 @@ async function main() {
     return lastHealthy ? { ...lastHealthy, changed: false } : null;
   }
 
+  // Waits for the document while the connection is still making progress.
+  // minWaitMs is a floor, not a deadline: as long as ChatGPT keeps producing
+  // network events the wait continues, so a slow proxy is not mistaken for a
+  // dead one. It stops when the connection has been silent for idleGraceMs.
   // expectedMarker guards against reading the previous document: without it a
   // still-loaded old page reports "complete" before the new navigation commits.
-  async function waitForChatGPTDocument(timeoutMs = 10000, sessionId = null, expectedMarker = null) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && cdp.isAlive()) {
+  async function waitForChatGPTDocument(minWaitMs = 10000, sessionId = null, expectedMarker = null, options = {}) {
+    const idleGraceMs = options.idleGraceMs ?? 12000;
+    const hardCapMs = options.hardCapMs ?? 240000;
+    const startedAt = Date.now();
+    lastChatGPTActivityAt = Date.now();
+
+    const shouldKeepWaiting = () => {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed >= hardCapMs) return false;
+      if (elapsed < minWaitMs) return true;
+      return Date.now() - lastChatGPTActivityAt < idleGraceMs;
+    };
+
+    while (shouldKeepWaiting() && cdp.isAlive()) {
       try {
         const res = await cdp.send('Runtime.evaluate', {
           expression: `JSON.stringify({
@@ -1643,7 +1698,7 @@ async function main() {
     await ensureSessionCookiePresent(stage);
   }
 
-  async function warmUpChatGPTInBackground(routeCountry, timeoutMs = 30000) {
+  async function warmUpChatGPTInBackground(routeCountry, timeoutMs = 10000) {
     let targetId = null;
     try {
       await ensureSessionCookiePresent('background warmup');
@@ -1669,7 +1724,7 @@ async function main() {
       await cdp.send('Page.navigate', {
         url: `https://chatgpt.com/?${warmupMarker}`
       }, sessionId);
-      const ready = await waitForChatGPTDocument(timeoutMs, sessionId, warmupMarker);
+      const ready = await waitForChatGPTDocument(timeoutMs, sessionId, warmupMarker, { idleGraceMs: 15000 });
       const state = ready ? await probeChatGPTSession(sessionId) : { status: 0 };
       trace('background_warmup', {
         ready,
@@ -1707,7 +1762,7 @@ async function main() {
     console.log('  🔄 Restoring the ChatGPT page before requesting the pay link...');
     const marker = `checkout_ready=${Date.now()}`;
     try { await cdp.send('Page.navigate', { url: `https://chatgpt.com/?${marker}` }); } catch {}
-    if (!await waitForChatGPTDocument(20000, null, marker)) {
+    if (!await waitForChatGPTDocument(8000, null, marker)) {
       trace('checkout_page_recovery_failed', { stage: 'document_not_ready' });
       return false;
     }
@@ -1759,7 +1814,7 @@ async function main() {
           `⚠️ navigation reported ${navigationError}`);
       }
 
-      documentReady = await waitForChatGPTDocument(20000 + (attempt - 1) * 10000, null, refreshMarker);
+      documentReady = await waitForChatGPTDocument(8000 + (attempt - 1) * 4000, null, refreshMarker);
       if (!documentReady) {
         trace('navigation_timed_out', { attempt, routeCountry: route.country },
           `⚠️ attempt ${attempt} did not finish loading`);
@@ -1816,11 +1871,11 @@ async function main() {
     const routeChangeExpected = reasons.some(reason => /ERR_|tunnel|connection|network/i.test(reason));
     const route = await waitForHealthyProxyRoute(
       lastKnownCountry,
-      45000,
+      120000,
       routeChangeExpected ? 6000 : 2000
     );
     if (!route) {
-      console.log('  ⚠️ The selected proxy did not become reachable within 45 seconds.');
+      console.log('  ⚠️ The selected proxy never answered, even with escalating time budgets.');
       console.log(`     Diagnostics: ${diagnosticsPath}\n`);
       trace('recovery_failed', { stage: 'proxy_route_unreachable' });
       return null;
@@ -1851,7 +1906,7 @@ async function main() {
       setRecoveryState('releasing-old-region');
       await releaseOldRegionState('before_warmup');
       setRecoveryState('background-warmup');
-      await warmUpChatGPTInBackground(route.country, 40000);
+      await warmUpChatGPTInBackground(route.country, 15000);
       await ensureSessionCookiePresent('after warmup');
       return navigateOnceAndVerify(route, { path: '/', hash: '' });
     }
@@ -2077,7 +2132,7 @@ async function main() {
 
   console.log('  ' + '─'.repeat(56));
   console.log('  🕵️  MONITORING MODE ACTIVE');
-  console.log('  📍 Watching for trial offers OR pricing pages');
+  console.log('  📍 Watching for trial offers OR upgrade/plan surfaces');
   console.log('  ⚡ Proxy recovery state machine: idle');
   console.log('  🌍 Country monitor 4s | exit-IP snapshot 10s (halved while idle)');
   console.log(`  🧾 Trace: ${TRACE_ENABLED ? 'every request, response, cookie, and page event' : 'off'}`);
@@ -2109,7 +2164,7 @@ async function main() {
     } else {
       // noTrial: user is on pricing page but no trial available
       const btnLabel = offer.buttonLabel || 'Upgrade';
-      console.log(`\n  💳 Pricing page detected — "${btnLabel}" button visible (no trial)`);
+      console.log(`\n  💳 Plan surface detected (${offer.surface || 'unknown'}) — "${btnLabel}" visible, so no free trial is offered`);
       awaitingInput = true;
       var rawAnswer = await ask('  Generate direct Plus pay link now?\n  Type "y" for YES, or press Enter for NO: ');
       awaitingInput = false;
