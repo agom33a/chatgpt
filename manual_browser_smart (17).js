@@ -1,7 +1,15 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v7.4 - Full trace stream)
+ *   🎯 ChatGPT Manual Browser Smart (v7.5 - Reliable checkout)
+ *
+ *   v7.5 additions:
+ *     - Splits the sentinel call from checkout and time-boxes it to 12s
+ *     - Raises checkout CDP/page timeouts so a slow route no longer aborts it
+ *     - Treats the server's set-cookie as the authoritative session token
+ *     - Removes duplicate session cookies that made the token oscillate
+ *     - Leaves Chrome's error page before probing the proxy route
+ *     - Drops the DomainMismatch cookie log flood
  *
  *   v7.4 additions:
  *     - Prints every request/response with exit IP, protocol, and duration
@@ -207,16 +215,16 @@ function cdpClient(ws) {
   ws.on('error', e => rejectPending(`CDP connection error: ${e.message}`));
 
   return {
-    send(method, params = {}, sessionId = null) {
+    send(method, params = {}, sessionId = null, timeoutMs = 30000) {
       if (!alive) return Promise.reject(new Error('CDP closed'));
       const i = ++id;
       return new Promise((res, rej) => {
         const timer = setTimeout(() => {
           if (pending.has(i)) {
             pending.delete(i);
-            rej(new Error(`CDP timeout: ${method}`));
+            rej(new Error(`CDP timeout after ${timeoutMs}ms: ${method}`));
           }
-        }, 30000);
+        }, timeoutMs);
         pending.set(i, { resolve: res, reject: rej, timer });
         const message = { id: i, method, params };
         if (sessionId) message.sessionId = sessionId;
@@ -491,8 +499,8 @@ async function getAccessToken(cdp, apiSession) {
     try {
       const res = await cdp.send('Runtime.evaluate', {
         expression: `fetch('/api/auth/session',{credentials:'include',cache:'no-store'}).then(r=>r.json()).then(d=>JSON.stringify({token:d.accessToken||null,account:(typeof d.account==='string'?d.account:(d.account&&d.account.id)||null)})).catch(e=>JSON.stringify({error:e.message}))`,
-        awaitPromise: true, returnByValue: true, timeout: 15000
-      });
+        awaitPromise: true, returnByValue: true, timeout: 20000
+      }, null, 25000);
       const data = JSON.parse(res.result?.value || '{}');
       if (data.token) return { token: data.token, account: data.account, source: 'page' };
     } catch {}
@@ -523,33 +531,50 @@ async function generateDirectPayLink(cdp, apiSession, country) {
     checkout_ui_mode: 'custom'
   };
 
+  // The sentinel call is requested separately and time-boxed: it has been
+  // observed taking ~30s, and checkout succeeds without it.
+  const sentinelExpr = `
+    (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+      try {
+        const res = await fetch('/backend-api/sentinel/chat-requirements', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + ${JSON.stringify(auth.token)},
+            'OAI-Language': 'en-US'
+          },
+          body: JSON.stringify({}),
+          credentials: 'include',
+          signal: controller.signal
+        });
+        const data = res.ok ? await res.json().catch(() => ({})) : {};
+        return JSON.stringify({ status: res.status, token: data.token || null });
+      } catch (e) {
+        return JSON.stringify({ status: 0, token: null, error: e.name === 'AbortError' ? 'timed out after 12s' : e.message });
+      } finally { clearTimeout(timer); }
+    })()
+  `;
+
+  let sentinel = { status: 0, token: null };
+  try {
+    const sentinelRes = await cdp.send('Runtime.evaluate', {
+      expression: sentinelExpr, awaitPromise: true, returnByValue: true, timeout: 20000
+    }, null, 25000);
+    sentinel = JSON.parse(sentinelRes.result?.value || '{}');
+  } catch (e) {
+    sentinel = { status: 0, token: null, error: e.message };
+  }
+  console.log(`     Sentinel: HTTP ${sentinel.status || 0}${sentinel.token ? ' (token acquired)' : ` (continuing without token${sentinel.error ? `: ${sentinel.error}` : ''})`}`);
+
   const evalExpr = `
     (async () => {
       try {
         const authHeader = 'Bearer ' + ${JSON.stringify(auth.token)};
         const accountHeader = ${JSON.stringify(auth.account || null)};
-
-        let sentinelToken = null;
-        let sentinelStatus = 0;
-        try {
-          const chReq = await fetch('/backend-api/sentinel/chat-requirements', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': authHeader,
-              'OAI-Language': 'en-US'
-            },
-            body: JSON.stringify({}),
-            credentials: 'include'
-          });
-          sentinelStatus = chReq.status;
-          if (chReq.ok) {
-            const chData = await chReq.json();
-            sentinelToken = chData.token;
-          }
-        } catch(e) {}
-
-        await new Promise(r => setTimeout(r, 1500));
+        const sentinelToken = ${JSON.stringify(sentinel.token || null)};
+        const sentinelStatus = ${JSON.stringify(sentinel.status || 0)};
 
         const headers = {
           'Content-Type': 'application/json',
@@ -570,9 +595,11 @@ async function generateDirectPayLink(cdp, apiSession, country) {
     })()
   `;
 
+  // Checkout itself has been seen taking several seconds under a fresh proxy
+  // route, so the page timeout and the CDP timeout both allow for that.
   const evalRes = await cdp.send('Runtime.evaluate', {
-    expression: evalExpr, awaitPromise: true, returnByValue: true, timeout: 30000
-  });
+    expression: evalExpr, awaitPromise: true, returnByValue: true, timeout: 90000
+  }, null, 100000);
   const resp = JSON.parse(evalRes.result?.value || '{}');
   if (resp.error) throw new Error('Fetch error: ' + resp.error);
 
@@ -644,21 +671,34 @@ async function clearRegionPinnedCookies(cdp, includeChallenge = false) {
   return cleared;
 }
 
-async function readSessionCookie(cdp) {
+// The jar can hold several cookies with this name (our injected host-only copy
+// plus the server's domain copy). Returning "the first match" made the active
+// token flip back and forth, so duplicates are reported and reconciled.
+async function readSessionCookies(cdp) {
   try {
     const result = await cdp.send('Network.getCookies', {
       urls: ['https://chatgpt.com/', 'https://chatgpt.com/api/auth/session']
     });
-    const cookie = (result.cookies || []).find(c => c.name === COOKIE_NAME);
-    return cookie?.value && cookie.value.length >= 20 ? cookie.value : null;
+    return (result.cookies || []).filter(c => c.name === COOKIE_NAME && (c.value || '').length >= 20);
   } catch {
-    return null;
+    return [];
   }
+}
+
+function parseSessionTokenFromSetCookie(headerValue) {
+  const prefix = `${COOKIE_NAME}=`;
+  for (const line of String(headerValue || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith(prefix)) continue;
+    const value = trimmed.slice(prefix.length).split(';')[0].trim();
+    if (value.length >= 20) return value;
+  }
+  return null;
 }
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v7.4 - Full Trace Stream)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v7.5 - Reliable Checkout)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -864,18 +904,57 @@ async function main() {
   try { await cdp.send('Page.setBypassCSP', { enabled: true }); } catch {}
   try { await cdp.send('Network.setBypassServiceWorker', { bypass: true }); } catch {}
 
-  async function syncActiveSessionCookie(source) {
-    const browserToken = await readSessionCookie(cdp);
-    if (!browserToken || browserToken === sessionToken) return false;
+  // Last session cookie value issued by the server, which wins over the jar.
+  let serverSessionToken = null;
+
+  // Once the server has issued a session cookie it is authoritative; the jar is
+  // only consulted while no server cookie has been seen yet.
+  function adoptSessionToken(token, source) {
+    if (!token || token === sessionToken) return false;
     const previousFingerprint = fingerprint(sessionToken);
-    sessionToken = browserToken;
+    sessionToken = token;
     trace('session_cookie_rotated', {
       source,
       previousFingerprint,
       fingerprint: fingerprint(sessionToken),
       cookieSize: sessionToken.length + COOKIE_NAME.length + 1
-    }, `🔑 session cookie rotated (${source}): ${previousFingerprint} → ${fingerprint(sessionToken)}`);
+    }, `🔑 session cookie updated (${source}): ${previousFingerprint} → ${fingerprint(sessionToken)}`);
     return true;
+  }
+
+  async function syncActiveSessionCookie(source) {
+    const cookies = await readSessionCookies(cdp);
+    if (!cookies.length) return false;
+
+    const distinct = new Set(cookies.map(c => c.value));
+    if (distinct.size > 1) {
+      // Keep the authoritative value and remove the stale duplicates that made
+      // the active token oscillate between two fingerprints.
+      const keep = serverSessionToken && distinct.has(serverSessionToken)
+        ? serverSessionToken
+        : cookies[0].value;
+      for (const cookie of cookies) {
+        if (cookie.value === keep) continue;
+        try {
+          await cdp.send('Network.deleteCookies', {
+            name: COOKIE_NAME,
+            domain: cookie.domain,
+            path: cookie.path || '/'
+          });
+        } catch {}
+      }
+      trace('session_cookie_duplicates_resolved', {
+        source,
+        removed: distinct.size - 1,
+        domains: cookies.map(c => c.domain)
+      }, `🔑 removed ${distinct.size - 1} duplicate session cookie(s)`);
+      adoptSessionToken(keep, `${source} (deduplicated)`);
+      await installSessionCookie(cdp, sessionToken);
+      return true;
+    }
+
+    if (serverSessionToken) return false;
+    return adoptSessionToken(cookies[0].value, source);
   }
 
   try { await cdp.send('Log.enable'); } catch {}
@@ -904,8 +983,12 @@ async function main() {
   });
 
   cdp.on('Network.requestWillBeSentExtraInfo', params => {
+    // DomainMismatch on third-party edge cookies is normal and would otherwise
+    // flood the stream; only the session cookie matters for that reason.
     const blocked = (params.associatedCookies || [])
       .filter(entry => (entry.blockedReasons || []).length)
+      .filter(entry => entry.cookie?.name === COOKIE_NAME ||
+        (entry.blockedReasons || []).some(reason => reason !== 'DomainMismatch'))
       .map(entry => `${entry.cookie?.name}:${(entry.blockedReasons || []).join('|')}`);
     if (!blocked.length) return;
     trace('cookies_blocked_on_request', {
@@ -959,7 +1042,8 @@ async function main() {
   });
 
   cdp.on('Network.responseReceivedExtraInfo', params => {
-    const setCookieNames = String(params.headers?.['set-cookie'] || params.headers?.['Set-Cookie'] || '')
+    const rawSetCookie = params.headers?.['set-cookie'] || params.headers?.['Set-Cookie'] || '';
+    const setCookieNames = String(rawSetCookie)
       .split('\n')
       .map(line => line.split('=')[0].trim())
       .filter(Boolean);
@@ -973,8 +1057,11 @@ async function main() {
         blocked
       }, `🍪 set-cookie [${setCookieNames.join(', ') || 'none'}]${blocked.length ? ` blocked [${blocked.join(', ')}]` : ''}`);
     }
-    if (setCookieNames.includes(COOKIE_NAME)) {
-      setTimeout(() => { void syncActiveSessionCookie('set-cookie response'); }, 0);
+
+    const issued = parseSessionTokenFromSetCookie(rawSetCookie);
+    if (issued) {
+      serverSessionToken = issued;
+      adoptSessionToken(issued, 'server set-cookie');
     }
   });
 
@@ -1194,7 +1281,7 @@ async function main() {
   }, 20000);
   const cookieSyncMonitor = setInterval(() => {
     if (cdp.isAlive() && !cleaning) void syncActiveSessionCookie('periodic sync');
-  }, 2000);
+  }, 5000);
 
   // Offer state (declared here so country monitor can reset it)
   let handled = false;
@@ -1266,10 +1353,34 @@ async function main() {
     }
   }
 
+  // Probes run in the page context, and Chrome's network error page rejects
+  // every fetch with a chrome-error scheme error. Move to a blank page first so
+  // the route check measures the proxy instead of the error page.
+  async function ensureProbeableContext() {
+    try {
+      const res = await cdp.send('Runtime.evaluate', {
+        expression: `JSON.stringify({protocol: location.protocol, host: location.hostname})`,
+        returnByValue: true, timeout: 3000
+      });
+      const location = JSON.parse(res.result?.value || '{}');
+      const brokenPage = /^chrome-error:/i.test(location.protocol || '') ||
+        location.host === 'chromewebdata';
+      if (!brokenPage) return false;
+      trace('probe_context_reset', { protocol: location.protocol, host: location.host },
+        '🧹 leaving Chrome error page so route probes can run');
+      await cdp.send('Page.navigate', { url: 'about:blank' });
+      await sleep(400);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // Waits for a usable route. A changed exit country is preferred, but an
   // unchanged one still counts once the change window passes, so an auth-only
   // failure is not stuck waiting for a country that never changes.
   async function waitForHealthyProxyRoute(previousCountry, timeoutMs = 45000, changeWindowMs = 6000) {
+    await ensureProbeableContext();
     const startedProbingAt = Date.now();
     const deadline = startedProbingAt + timeoutMs;
     let probeNumber = 0;
