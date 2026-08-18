@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v7.1 - First-refresh recovery)
+ *   🎯 ChatGPT Manual Browser Smart (v7.2 - Background session warm-up)
  *
+ *   v7.2 additions:
+ *     - Cancels stale trial prompts during a network transition
+ *     - Reopens the offer prompt after the new country is ready
+ *     - Tracks server-rotated session cookies instead of forcing a stale token
+ *     - Primes the first post-IP-change document in a background target
  *   v7.1 additions:
  *     - Persists the session in Chrome's cookie jar, not headers only
  *     - Probes the selected proxy invisibly before touching ChatGPT
@@ -142,7 +147,7 @@ function cdpClient(ws) {
       clearTimeout(p.timer);
       m.error ? p.reject(new Error(m.error.message)) : p.resolve(m.result);
     } else if (m.method && listeners.has(m.method)) {
-      listeners.get(m.method).forEach(fn => { try { fn(m.params); } catch {} });
+      listeners.get(m.method).forEach(fn => { try { fn(m.params, m.sessionId || null); } catch {} });
     }
   });
   const rejectPending = reason => {
@@ -157,7 +162,7 @@ function cdpClient(ws) {
   ws.on('error', e => rejectPending(`CDP connection error: ${e.message}`));
 
   return {
-    send(method, params = {}) {
+    send(method, params = {}, sessionId = null) {
       if (!alive) return Promise.reject(new Error('CDP closed'));
       const i = ++id;
       return new Promise((res, rej) => {
@@ -168,7 +173,9 @@ function cdpClient(ws) {
           }
         }, 30000);
         pending.set(i, { resolve: res, reject: rej, timer });
-        try { ws.send(JSON.stringify({ id: i, method, params })); }
+        const message = { id: i, method, params };
+        if (sessionId) message.sessionId = sessionId;
+        try { ws.send(JSON.stringify(message)); }
         catch (e) {
           clearTimeout(timer);
           pending.delete(i);
@@ -221,12 +228,31 @@ function startProxyRelay(proxyStr, localPort) {
 }
 
 let sharedRL = null;
+let activeQuestionAbort = null;
 function getRL() {
   if (!sharedRL) sharedRL = readline.createInterface({ input: process.stdin, output: process.stdout });
   return sharedRL;
 }
 function ask(q) {
-  return new Promise(r => getRL().question(q, a => r(a.trim())));
+  return new Promise(resolve => {
+    const controller = new AbortController();
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      if (activeQuestionAbort === cancel) activeQuestionAbort = null;
+      resolve(value);
+    };
+    const cancel = () => {
+      controller.abort();
+      finish(null);
+    };
+    activeQuestionAbort = cancel;
+    getRL().question(q, { signal: controller.signal }, answer => finish(answer.trim()));
+  });
+}
+function cancelActiveQuestion() {
+  if (activeQuestionAbort) activeQuestionAbort();
 }
 
 // ── Timezone → Country mapping (fallback if IP APIs fail) ──
@@ -489,9 +515,21 @@ async function installSessionCookie(cdp, sessionToken) {
   }
 }
 
+async function readSessionCookie(cdp) {
+  try {
+    const result = await cdp.send('Network.getCookies', {
+      urls: ['https://chatgpt.com/', 'https://chatgpt.com/api/auth/session']
+    });
+    const cookie = (result.cookies || []).find(c => c.name === COOKIE_NAME);
+    return cookie?.value && cookie.value.length >= 20 ? cookie.value : null;
+  } catch {
+    return null;
+  }
+}
+
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v7.1 - First-Refresh Recovery)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v7.2 - Background Session Warm-up)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -537,7 +575,7 @@ async function main() {
 
   let proxyStr = null;
   if (proxies.length > 0) {
-    const useProxy = (await ask('  Use proxy? [Y/n]: ')).toLowerCase();
+    const useProxy = ((await ask('  Use proxy? [Y/n]: ')) || '').toLowerCase();
     if (useProxy !== 'n') {
       proxyStr = proxies[0];
       if (proxyStr.includes('{COUNTRY}')) proxyStr = proxyStr.replace(/\{COUNTRY\}/gi, 'us');
@@ -689,6 +727,25 @@ async function main() {
   try { await cdp.send('Page.setBypassCSP', { enabled: true }); } catch {}
   try { await cdp.send('Network.setBypassServiceWorker', { bypass: true }); } catch {}
 
+  async function syncActiveSessionCookie(source) {
+    const browserToken = await readSessionCookie(cdp);
+    if (!browserToken || browserToken === sessionToken) return false;
+    sessionToken = browserToken;
+    trace('session_cookie_rotated', {
+      source,
+      cookieSize: sessionToken.length + COOKIE_NAME.length + 1
+    });
+    return true;
+  }
+
+  cdp.on('Network.responseReceivedExtraInfo', params => {
+    const hasSetCookie = Object.keys(params.headers || {})
+      .some(name => name.toLowerCase() === 'set-cookie');
+    if (hasSetCookie) {
+      setTimeout(() => { void syncActiveSessionCookie('set-cookie response'); }, 0);
+    }
+  });
+
   try {
     await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
       source: `
@@ -836,6 +893,7 @@ async function main() {
 
   if (verifiedEmail) console.log(`  ✅ Logged in as: ${verifiedEmail}\n`);
   else console.log('  ⚠️ Login verification uncertain (will try anyway)\n');
+  await syncActiveSessionCookie('initial login');
   if (initialCountry) console.log(`  🌍 Initial country: ${initialCountry} (${currencyForCountry(initialCountry)})\n`);
 
   // Country is detected JUST-IN-TIME at checkout, not here.
@@ -846,6 +904,9 @@ async function main() {
     if (!cdp.isAlive()) { clearInterval(keepAlive); return; }
     try { await cdp.send('Browser.getVersion'); } catch {}
   }, 20000);
+  const cookieSyncMonitor = setInterval(() => {
+    if (cdp.isAlive() && !cleaning) void syncActiveSessionCookie('periodic sync');
+  }, 2000);
 
   // Offer state (declared here so country monitor can reset it)
   let handled = false;
@@ -863,7 +924,7 @@ async function main() {
   // Probe the freshly loaded page instead of assuming that Page.reload means
   // the session has recovered. During a proxy switch ChatGPT commonly returns
   // one logged-out/401 page before accepting the injected session cookie.
-  async function probeChatGPTSession() {
+  async function probeChatGPTSession(sessionId = null) {
     try {
       const res = await cdp.send('Runtime.evaluate', {
         expression: `Promise.all([
@@ -874,7 +935,7 @@ async function main() {
         ]).then(([session,me])=>JSON.stringify({...session,...me}))
           .catch(e=>JSON.stringify({status:0,error:e.message}))`,
         awaitPromise: true, returnByValue: true, timeout: 12000
-      });
+      }, sessionId);
       return JSON.parse(res.result?.value || '{}');
     } catch (e) {
       return { status: 0, error: e.message };
@@ -946,7 +1007,7 @@ async function main() {
     return null;
   }
 
-  async function waitForChatGPTDocument(timeoutMs = 10000) {
+  async function waitForChatGPTDocument(timeoutMs = 10000, sessionId = null) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline && cdp.isAlive()) {
       try {
@@ -957,7 +1018,7 @@ async function main() {
             hasBody: !!document.body
           })`,
           returnByValue: true, timeout: 3000
-        });
+        }, sessionId);
         const page = JSON.parse(res.result?.value || '{}');
         if (page.host === 'chatgpt.com' && page.hasBody &&
             (page.ready === 'interactive' || page.ready === 'complete')) return true;
@@ -967,17 +1028,63 @@ async function main() {
     return false;
   }
 
-  async function verifyStableSession() {
-    const first = await probeChatGPTSession();
+  async function verifyStableSession(sessionId = null) {
+    const first = await probeChatGPTSession(sessionId);
     if (!first.loggedIn || first.status !== 200 || !/^[A-Z]{2}$/i.test(first.country || '')) {
       return { ok: false, state: first };
     }
 
     await sleep(900);
-    const second = await probeChatGPTSession();
+    const second = await probeChatGPTSession(sessionId);
     const stable = second.loggedIn && second.status === 200 &&
       second.country === first.country;
     return { ok: stable, state: second, previousCountry: first.country };
+  }
+
+  async function warmUpChatGPTInBackground(routeCountry) {
+    let targetId = null;
+    try {
+      await installSessionCookie(cdp, sessionToken);
+      const target = await cdp.send('Target.createTarget', {
+        url: 'about:blank',
+        background: true
+      });
+      targetId = target.targetId;
+      const attached = await cdp.send('Target.attachToTarget', {
+        targetId,
+        flatten: true
+      });
+      const sessionId = attached.sessionId;
+
+      await cdp.send('Network.enable', {}, sessionId);
+      await cdp.send('Page.enable', {}, sessionId);
+      await cdp.send('Runtime.enable', {}, sessionId);
+      try {
+        await cdp.send('Network.setBypassServiceWorker', { bypass: true }, sessionId);
+      } catch {}
+
+      await cdp.send('Page.navigate', {
+        url: `https://chatgpt.com/?proxy_warmup=${Date.now()}`
+      }, sessionId);
+      const ready = await waitForChatGPTDocument(12000, sessionId);
+      const state = ready ? await probeChatGPTSession(sessionId) : { status: 0 };
+      trace('background_warmup', {
+        ready,
+        loggedIn: !!state.loggedIn,
+        status: state.status || 0,
+        country: state.country || null,
+        routeCountry
+      });
+      return { ready, state };
+    } catch (e) {
+      trace('background_warmup_failed', { error: e.message, routeCountry });
+      return { ready: false, state: { error: e.message } };
+    } finally {
+      if (targetId) {
+        try { await cdp.send('Target.closeTarget', { targetId }); } catch {}
+      }
+      await syncActiveSessionCookie('background warmup');
+    }
   }
 
   async function performRecovery(reasons) {
@@ -1017,6 +1124,25 @@ async function main() {
       console.log('  ✅ Existing page recovered without a refresh.');
       console.log(`  🌍 Country: ${oldCountry || '?'} → ${state.country} (${currencyForCountry(state.country)})\n`);
       trace('recovery_succeeded', { mode: 'no_navigation', country: state.country });
+      return state;
+    }
+
+    // ChatGPT commonly uses the first document request after an IP change to
+    // invalidate the old regional edge session. Perform that request in a
+    // background target so the user's tab never displays the logged-out step.
+    recoveryState = 'background-warmup';
+    console.log('  🔥 Priming ChatGPT session in the background...');
+    await warmUpChatGPTInBackground(route.country);
+    await installSessionCookie(cdp, sessionToken);
+
+    const afterWarmup = await verifyStableSession();
+    if (afterWarmup.ok && afterWarmup.state.country === route.country) {
+      const state = afterWarmup.state;
+      const oldCountry = lastKnownCountry;
+      lastKnownCountry = state.country;
+      console.log('  ✅ Session recovered after background warm-up; no page refresh needed.');
+      console.log(`  🌍 Country: ${oldCountry || '?'} → ${state.country} (${currencyForCountry(state.country)})\n`);
+      trace('recovery_succeeded', { mode: 'background_warmup', country: state.country });
       return state;
     }
 
@@ -1080,6 +1206,7 @@ async function main() {
     pendingRecoveryReasons.add(reason);
     if (recoveryPromise) return recoveryPromise;
 
+    cancelActiveQuestion();
     recoveryPromise = (async () => {
       autoReloadInProgress = true;
       handled = false;
@@ -1188,6 +1315,7 @@ async function main() {
 
   while (cdp.isAlive() && !cleaning) {
     await sleep(2500);
+    if (autoReloadInProgress) continue;
     if (handled && lastOfferSeen) {
       const cur = await detectOffer(cdp);
       if (!cur.found) { handled = false; lastOfferSeen = false; }
@@ -1205,16 +1333,24 @@ async function main() {
     if (isTrial) {
       console.log('\n  🎁 Trial offer detected on the page!');
       awaitingInput = true;
-      var answer = (await ask('  Skip trial and get direct Plus checkout?\n  Type "y" for YES, or press Enter for NO: ')).toLowerCase().trim();
+      var rawAnswer = await ask('  Skip trial and get direct Plus checkout?\n  Type "y" for YES, or press Enter for NO: ');
       awaitingInput = false;
     } else {
       // noTrial: user is on pricing page but no trial available
       const btnLabel = offer.buttonLabel || 'Upgrade';
       console.log(`\n  💳 Pricing page detected — "${btnLabel}" button visible (no trial)`);
       awaitingInput = true;
-      var answer = (await ask('  Generate direct Plus pay link now?\n  Type "y" for YES, or press Enter for NO: ')).toLowerCase().trim();
+      var rawAnswer = await ask('  Generate direct Plus pay link now?\n  Type "y" for YES, or press Enter for NO: ');
       awaitingInput = false;
     }
+
+    if (rawAnswer === null) {
+      console.log('  ↻ Prompt canceled because the network changed; it will reappear after recovery.\n');
+      handled = false;
+      lastOfferSeen = false;
+      continue;
+    }
+    const answer = rawAnswer.toLowerCase().trim();
 
     if (answer !== 'y' && answer !== 'yes') {
       console.log('  ⏭️  Skipped. Won\'t ask again for this page.\n');
@@ -1232,7 +1368,7 @@ async function main() {
     } else {
       console.log('  ⚠️ Detection failed');
       awaitingInput = true;
-      const manual = (await ask('  Enter country manually (2-letter code, Enter=US): ')).toUpperCase().trim();
+      const manual = ((await ask('  Enter country manually (2-letter code, Enter=US): ')) || '').toUpperCase().trim();
       awaitingInput = false;
       if (manual && /^[A-Z]{2}$/.test(manual)) country = manual;
       console.log(`  ✓ Using: ${country} (${currencyForCountry(country)})`);
@@ -1258,6 +1394,7 @@ async function main() {
   }
 
   clearInterval(keepAlive);
+  clearInterval(cookieSyncMonitor);
   clearInterval(countryMonitor);
   if (typeof leakDetector !== 'undefined') clearInterval(leakDetector);
   if (typeof statsReporter !== 'undefined') clearInterval(statsReporter);
