@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v9.0 - Isolated API checkout)
+ *   🎯 ChatGPT Manual Browser Smart (v9.1 - Isolated recovery race)
+ *
+ *   v9.1 additions:
+ *     - Races three disposable background recovery paths and requires two
+ *       authenticated checks matching the new exit country
+ *     - Cancels and closes losing targets; the visible target is not navigated
+ *       until a verified winner exists
+ *     - Keeps session-cookie rotation browser-owned throughout the race
  *
  *   v9.0 additions:
  *     - Creates checkout from a disposable background API target, independent
@@ -173,6 +180,7 @@ const {
   runChatGPTReadinessBenchmark,
   selectReadinessRecovery
 } = require('./chatgpt_readiness');
+const { runIsolatedChatGPTRecovery } = require('./isolated_chatgpt_recovery');
 const { runIsolatedCheckout } = require('./isolated_checkout');
 
 // Full-visibility tracing. TRACE=0 silences the stream, TRACE_ASSETS=1 also
@@ -324,6 +332,13 @@ function cdpClient(ws) {
     on(method, fn) {
       if (!listeners.has(method)) listeners.set(method, []);
       listeners.get(method).push(fn);
+      return () => {
+        const handlers = listeners.get(method);
+        if (!handlers) return;
+        const index = handlers.indexOf(fn);
+        if (index !== -1) handlers.splice(index, 1);
+        if (!handlers.length) listeners.delete(method);
+      };
     },
     isAlive: () => alive
   };
@@ -899,7 +914,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v9.0 - Isolated API Checkout)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v9.1 - Isolated Recovery Race)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');

@@ -24,6 +24,7 @@ class ProgressBudget {
     this.idleTimeoutMs = idleTimeoutMs;
     this.hardDeadline = Date.now() + hardTimeoutMs;
     this.lastProgressAt = Date.now();
+    this.pausedAt = null;
   }
 
   check() {
@@ -40,30 +41,50 @@ class ProgressBudget {
     this.trace(stage, details);
   }
 
+  touch() {
+    if (!this.pausedAt) this.lastProgressAt = Date.now();
+  }
+
+  pause() {
+    if (!this.pausedAt) this.pausedAt = Date.now();
+  }
+
+  resume() {
+    if (this.pausedAt) {
+      this.hardDeadline += Date.now() - this.pausedAt;
+      this.pausedAt = null;
+    }
+    this.lastProgressAt = Date.now();
+    if (this.signal?.aborted) throw abortError(this.signal.reason?.message || 'Checkout cancelled');
+  }
+
   async run(stage, timeoutMs, operation) {
     this.progress(`${stage}_started`);
-    const remainingHardMs = this.hardDeadline - Date.now();
-    const budgetMs = Math.max(1, Math.min(timeoutMs, this.idleTimeoutMs, remainingHardMs));
-    let timer;
-    let abortListener;
+    const stageDeadline = Date.now() + timeoutMs;
+    let monitorTimer;
     try {
-      const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${stage} timed out after ${budgetMs}ms without progress`)), budgetMs);
+      const monitor = new Promise((_, reject) => {
+        monitorTimer = setInterval(() => {
+          const now = Date.now();
+          if (this.signal?.aborted) {
+            reject(abortError(this.signal.reason?.message || 'Checkout cancelled'));
+          } else if (now >= this.hardDeadline) {
+            reject(new Error('Checkout hard timeout exceeded'));
+          } else if (now >= stageDeadline) {
+            reject(new Error(`${stage} timed out after ${timeoutMs}ms`));
+          } else if (now - this.lastProgressAt >= this.idleTimeoutMs) {
+            reject(new Error(`${stage} stopped making progress for ${this.idleTimeoutMs}ms`));
+          }
+        }, Math.max(5, Math.min(250, Math.floor(this.idleTimeoutMs / 4))));
       });
-      const cancelled = new Promise((_, reject) => {
-        if (!this.signal) return;
-        abortListener = () => reject(abortError(this.signal.reason?.message || 'Checkout cancelled'));
-        this.signal.addEventListener('abort', abortListener, { once: true });
-      });
-      const result = await Promise.race([operation(), timeout, cancelled]);
+      const result = await Promise.race([operation(), monitor]);
       this.progress(`${stage}_succeeded`);
       return result;
     } catch (error) {
       this.trace(`${stage}_failed`, { error: error.message });
       throw error;
     } finally {
-      clearTimeout(timer);
-      if (abortListener) this.signal.removeEventListener('abort', abortListener);
+      clearInterval(monitorTimer);
     }
   }
 }
@@ -336,8 +357,14 @@ async function runIsolatedCheckout(options) {
   const trace = (stage, details = {}) => rawTrace('checkout_api_stage', { stage, ...details });
   const budget = new ProgressBudget({ signal, trace, idleTimeoutMs, hardTimeoutMs });
   let target;
+  let stopNetworkProgress = null;
   try {
     target = await createApiTarget(cdp, budget);
+    if (typeof cdp.on === 'function') {
+      stopNetworkProgress = cdp.on('Network.responseReceived', (_params, eventSessionId) => {
+        if (eventSessionId === target.sessionId) budget.touch();
+      });
+    }
     const detected = await detectExitCountry(cdp, target.sessionId, budget);
     await establishApiOrigin(cdp, target.sessionId, budget);
     const auth = await resolveAuth(cdp, target.sessionId, apiSession, budget);
@@ -347,8 +374,13 @@ async function runIsolatedCheckout(options) {
       reliable: detected.reliable,
       agreeingProviders: detected.agreeingProviders
     });
-    const decision = await confirm(detected);
-    budget.check();
+    budget.pause();
+    let decision;
+    try {
+      decision = await confirm(detected);
+    } finally {
+      budget.resume();
+    }
     if (!decision?.confirmed) {
       budget.progress('user_confirmation_declined');
       return { cancelled: true };
@@ -369,6 +401,7 @@ async function runIsolatedCheckout(options) {
     });
     return result;
   } finally {
+    if (typeof stopNetworkProgress === 'function') stopNetworkProgress();
     if (target?.targetId) {
       try {
         await cdp.send('Target.closeTarget', { targetId: target.targetId }, null, 5000);

@@ -102,6 +102,22 @@ test('an idle checkout times out and closes its API target', async () => {
   assert.ok(cdp.calls.some(call => call.method === 'Target.closeTarget'));
 });
 
+test('time waiting for country confirmation does not consume the idle budget', async () => {
+  const cdp = createMockCdp('about:blank');
+  const result = await runIsolatedCheckout({
+    cdp,
+    apiSession: { accessToken: 'token', account: { id: 'account-id' } },
+    currencyForCountry: () => 'PHP',
+    confirm: async detected => {
+      await new Promise(resolve => setTimeout(resolve, 30));
+      return { confirmed: true, country: detected.country };
+    },
+    idleTimeoutMs: 10,
+    hardTimeoutMs: 1000
+  });
+  assert.equal(result.country, 'PH');
+});
+
 test('normalizes account identity without exposing credentials', () => {
   assert.deepEqual(
     normalizeAuth({ accessToken: 'token', account: { account_id: 'acct' } }),
