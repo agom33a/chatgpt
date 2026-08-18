@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v6.3 - Stable proxy switching)
+ *   🎯 ChatGPT Manual Browser Smart (v7.0 - Proxy recovery state machine)
  *
- *   v6.3 additions:
- *     - Controlled session recovery after proxy/country changes
- *     - Avoids refresh loops while the new proxy route is settling
- *     - Bypasses service-worker/cache state and verifies login after refresh
+ *   v7.0 additions:
+ *     - State-machine recovery after proxy/country changes
+ *     - Detects tunnel resets and network changes before an HTTP response
+ *     - Releases stale renderer/cache/socket state before reconnecting
+ *     - Confirms login and country twice before reporting success
+ *     - CDP requests now clean up timers and surface unexpected failures
  *   v6.2 additions:
  *     - Detects "Rejoin Plus" / "Reactivate Plus" buttons (previous subscribers)
  *     - Also handles promo_campaign URLs (?promo_campaign=plus-1-month-free)
@@ -60,8 +62,12 @@ const os = require('os');
 const readline = require('readline');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-process.on('uncaughtException', () => {});
-process.on('unhandledRejection', () => {});
+process.on('uncaughtException', e => {
+  console.error(`\n❌ Unexpected error: ${e?.stack || e}`);
+});
+process.on('unhandledRejection', e => {
+  console.error(`\n❌ Unhandled promise rejection: ${e?.stack || e}`);
+});
 
 const COOKIE_NAME = '__Secure-next-auth.session-token';
 
@@ -125,26 +131,43 @@ function cdpClient(ws) {
   ws.on('message', msg => {
     let m; try { m = JSON.parse(msg.toString()); } catch { return; }
     if (m.id && pending.has(m.id)) {
-      const p = pending.get(m.id); pending.delete(m.id);
+      const p = pending.get(m.id);
+      pending.delete(m.id);
+      clearTimeout(p.timer);
       m.error ? p.reject(new Error(m.error.message)) : p.resolve(m.result);
     } else if (m.method && listeners.has(m.method)) {
       listeners.get(m.method).forEach(fn => { try { fn(m.params); } catch {} });
     }
   });
-  ws.on('close', () => { alive = false; });
-  ws.on('error', () => { alive = false; });
+  const rejectPending = reason => {
+    alive = false;
+    for (const p of pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    pending.clear();
+  };
+  ws.on('close', () => rejectPending('CDP connection closed'));
+  ws.on('error', e => rejectPending(`CDP connection error: ${e.message}`));
 
   return {
     send(method, params = {}) {
       if (!alive) return Promise.reject(new Error('CDP closed'));
       const i = ++id;
       return new Promise((res, rej) => {
-        pending.set(i, { resolve: res, reject: rej });
-        try { ws.send(JSON.stringify({ id: i, method, params })); }
-        catch (e) { pending.delete(i); rej(e); }
-        setTimeout(() => {
-          if (pending.has(i)) { pending.delete(i); rej(new Error(`CDP timeout: ${method}`)); }
+        const timer = setTimeout(() => {
+          if (pending.has(i)) {
+            pending.delete(i);
+            rej(new Error(`CDP timeout: ${method}`));
+          }
         }, 30000);
+        pending.set(i, { resolve: res, reject: rej, timer });
+        try { ws.send(JSON.stringify({ id: i, method, params })); }
+        catch (e) {
+          clearTimeout(timer);
+          pending.delete(i);
+          rej(e);
+        }
       });
     },
     on(method, fn) {
@@ -445,7 +468,7 @@ async function openInNewTab(cdp, url) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v6.3 - Stable Proxy Switching)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v7.0 - Proxy Recovery)');
   console.log('='.repeat(60) + '\n');
 
   if (!fs.existsSync('./session_api.json')) {
@@ -775,12 +798,14 @@ async function main() {
   let handled = false;
   let lastOfferSeen = false;
 
-  // ⭐ v6.0 shared state (declared before listeners that reference them)
+  // Connection state shared by all network signals.
   let lastKnownCountry = null;
   let autoReloadInProgress = false;
   let last401At = 0;
+  let lastTransportFailureAt = 0;
   let recoveryPromise = null;
-  let recoveryCooldownUntil = 0;
+  let recoveryState = 'idle';
+  const pendingRecoveryReasons = new Set();
 
   // Probe the freshly loaded page instead of assuming that Page.reload means
   // the session has recovered. During a proxy switch ChatGPT commonly returns
@@ -803,60 +828,119 @@ async function main() {
     }
   }
 
-  async function recoverAfterProxyChange(reason) {
+  async function waitForChatGPTDocument(timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && cdp.isAlive()) {
+      try {
+        const res = await cdp.send('Runtime.evaluate', {
+          expression: `JSON.stringify({
+            host: location.hostname,
+            ready: document.readyState,
+            hasBody: !!document.body
+          })`,
+          returnByValue: true, timeout: 3000
+        });
+        const page = JSON.parse(res.result?.value || '{}');
+        if (page.host === 'chatgpt.com' && page.hasBody &&
+            (page.ready === 'interactive' || page.ready === 'complete')) return true;
+      } catch {}
+      await sleep(350);
+    }
+    return false;
+  }
+
+  async function verifyStableSession() {
+    const first = await probeChatGPTSession();
+    if (!first.loggedIn || first.status !== 200 || !/^[A-Z]{2}$/i.test(first.country || '')) {
+      return { ok: false, state: first };
+    }
+
+    await sleep(900);
+    const second = await probeChatGPTSession();
+    const stable = second.loggedIn && second.status === 200 &&
+      second.country === first.country;
+    return { ok: stable, state: second, previousCountry: first.country };
+  }
+
+  async function performRecovery(reasons) {
+    recoveryState = 'settling';
+    console.log(`\n  🔌 Network transition detected: ${reasons.join(', ')}`);
+    console.log('  ⏳ Waiting for the proxy route to settle...');
+    await sleep(1800);
+
+    try { await cdp.send('Page.stopLoading'); } catch {}
+    try { await cdp.send('Network.setCacheDisabled', { cacheDisabled: true }); } catch {}
+    try { await cdp.send('Network.clearBrowserCache'); } catch {}
+
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      recoveryState = 'reconnecting';
+      console.log(`  🔄 Reconnecting ChatGPT (attempt ${attempt}/4)...`);
+
+      // Move away from the old renderer and close its pooled sockets before
+      // loading ChatGPT through the extension's newly selected proxy.
+      try { await cdp.send('Page.navigate', { url: 'about:blank' }); } catch {}
+      await sleep(500);
+      try { await cdp.send('Network.closeIdleConnections'); } catch {}
+      try { await cdp.send('Network.clearBrowserCache'); } catch {}
+
+      const freshUrl = `https://chatgpt.com/?proxy_refresh=${Date.now()}`;
+      try { await cdp.send('Page.navigate', { url: freshUrl }); } catch {}
+
+      const documentReady = await waitForChatGPTDocument(10000);
+      if (!documentReady) {
+        console.log('     Page route is not ready yet');
+        await sleep(700);
+        continue;
+      }
+
+      recoveryState = 'verifying';
+      const verification = await verifyStableSession();
+      const state = verification.state || {};
+      if (verification.ok) {
+        const oldCountry = lastKnownCountry;
+        lastKnownCountry = state.country;
+        try {
+          await cdp.send('Runtime.evaluate', {
+            expression: `history.replaceState(null, '', '/')`,
+            returnByValue: true, timeout: 3000
+          });
+        } catch {}
+
+        console.log(`  ✅ Session restored${state.email ? `: ${state.email}` : ''}`);
+        if (oldCountry && oldCountry !== state.country) {
+          console.log(`  🌍 Country changed: ${oldCountry} → ${state.country} (${currencyForCountry(state.country)})\n`);
+        } else {
+          console.log(`  🌍 Country confirmed twice: ${state.country} (${currencyForCountry(state.country)})\n`);
+        }
+        return state;
+      }
+
+      const detail = state.status ? `HTTP ${state.status}` : (state.error || 'session/country not stable');
+      console.log(`     Verification failed (${detail})`);
+      await sleep(900);
+    }
+
+    console.log('  ⚠️ The proxy route still is not stable; monitoring remains active.');
+    console.log('     The next network signal will start a fresh recovery cycle.\n');
+    return null;
+  }
+
+  function requestProxyRecovery(reason) {
+    if (cleaning || !cdp.isAlive()) return Promise.resolve(null);
+    pendingRecoveryReasons.add(reason);
     if (recoveryPromise) return recoveryPromise;
-    if (Date.now() < recoveryCooldownUntil) return null;
 
     recoveryPromise = (async () => {
       autoReloadInProgress = true;
       handled = false;
       lastOfferSeen = false;
-
-      console.log(`\n  🔌 Connection changed (${reason})`);
-      console.log('  ⏳ Waiting for the new proxy route to settle...');
-      await sleep(1800);
-
-      try { await cdp.send('Page.stopLoading'); } catch {}
-      try { await cdp.send('Network.setCacheDisabled', { cacheDisabled: true }); } catch {}
-      try { await cdp.send('Network.clearBrowserCache'); } catch {}
-
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        console.log(`  🔄 Reconnecting ChatGPT (attempt ${attempt}/3)...`);
-
-        // Navigating away first releases the page that is still bound to the
-        // previous proxy route. closeIdleConnections is supported by newer
-        // Chromium builds; older builds safely fall back to the navigation.
-        try { await cdp.send('Page.navigate', { url: 'about:blank' }); } catch {}
-        await sleep(600);
-        try { await cdp.send('Network.closeIdleConnections'); } catch {}
-        try { await cdp.send('Network.clearBrowserCache'); } catch {}
-
-        const freshUrl = `https://chatgpt.com/?proxy_refresh=${Date.now()}`;
-        try { await cdp.send('Page.navigate', { url: freshUrl }); } catch {}
-        await sleep(attempt === 1 ? 3200 : 2400);
-
-        const state = await probeChatGPTSession();
-        if (state.loggedIn && state.status === 200) {
-          lastKnownCountry = state.country || null;
-          console.log(`  ✅ Session restored${state.email ? `: ${state.email}` : ''}`);
-          if (state.country) {
-            console.log(`  🌍 ChatGPT confirmed country: ${state.country} (${currencyForCountry(state.country)})\n`);
-          }
-          return state;
-        }
-
-        const detail = state.status ? `HTTP ${state.status}` : (state.error || 'page not ready');
-        console.log(`     Session not ready yet (${detail})`);
-        await sleep(1000);
-      }
-
-      console.log('  ⚠️ Proxy is reachable, but ChatGPT has not restored the session yet.');
-      console.log('     Recovery will retry automatically after the cooldown.\n');
-      recoveryCooldownUntil = Date.now() + 5000;
-      return null;
+      const reasons = [...pendingRecoveryReasons];
+      pendingRecoveryReasons.clear();
+      return performRecovery(reasons);
     })().finally(async () => {
       try { await cdp.send('Network.setCacheDisabled', { cacheDisabled: false }); } catch {}
       autoReloadInProgress = false;
+      recoveryState = 'idle';
       recoveryPromise = null;
     });
 
@@ -872,6 +956,9 @@ async function main() {
     const status = params.response?.status;
     if (status !== 401 && status !== 403) return;
     if (!/chatgpt\.com\/(backend-api|api)\//i.test(url)) return;
+    // A 403 can be an ordinary endpoint permission/WAF response. Treat it as
+    // a session signal only on endpoints that actually describe the session.
+    if (status === 403 && !/\/(backend-api\/me|api\/auth\/session)(?:[/?]|$)/i.test(url)) return;
 
     // Debounce: only react once per 5 seconds
     const now = Date.now();
@@ -880,9 +967,25 @@ async function main() {
 
     const endpoint = url.replace(/^https?:\/\/[^/]+/, '');
     console.log(`\n  ⚡ Detected ${status} on ${endpoint}`);
-    // Do not reload directly here. That raced the proxy extension and caused
-    // repeated loading/old-country loops.
-    void recoverAfterProxyChange(`${status} response`);
+    void requestProxyRecovery(`${status} response`);
+  });
+
+  // A proxy extension often drops the old tunnel before ChatGPT can return
+  // 401. Transport failures therefore provide an earlier recovery signal.
+  cdp.on('Network.loadingFailed', params => {
+    if (autoReloadInProgress || cleaning || params.canceled) return;
+    const error = params.errorText || '';
+    const resourceType = params.type || '';
+    if (!['Document', 'XHR', 'Fetch'].includes(resourceType)) return;
+    const routeFailure = /(ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED)/i.test(error);
+    const mainDocumentTimeout = resourceType === 'Document' && /ERR_TIMED_OUT/i.test(error);
+    if (!routeFailure && !mainDocumentTimeout) return;
+
+    const now = Date.now();
+    if (now - lastTransportFailureAt < 4000) return;
+    lastTransportFailureAt = now;
+    console.log(`\n  ⚡ Transport failure detected: ${error}`);
+    void requestProxyRecovery(error.replace(/^net::/, ''));
   });
 
   // Background country monitor (backup layer + country change detection)
@@ -896,7 +999,7 @@ async function main() {
       const data = JSON.parse(res.result?.value || '{}');
 
       if (data.status === 401 || data.status === 403) {
-        void recoverAfterProxyChange(`${data.status} from country check`);
+        void requestProxyRecovery(`${data.status} from country check`);
         return;
       }
 
@@ -918,7 +1021,7 @@ async function main() {
   console.log('  ' + '─'.repeat(56));
   console.log('  🕵️  MONITORING MODE ACTIVE');
   console.log('  📍 Watching for trial offers OR pricing pages');
-  console.log('  ⚡ Controlled 401 recovery (prevents proxy refresh loops)');
+  console.log('  ⚡ Proxy recovery state machine: idle');
   console.log('  🌍 Country change monitor (every 4s as backup)');
   console.log('  💡 Press Ctrl+C to quit at any time');
   console.log('  ' + '─'.repeat(56) + '\n');
