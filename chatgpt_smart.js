@@ -4638,6 +4638,17 @@ var {
 } = require_chatgpt_readiness();
 var { runIsolatedChatGPTRecovery } = require_isolated_chatgpt_recovery();
 var { runIsolatedCheckout } = require_isolated_checkout();
+var CLI_ARGS = process.argv.slice(2);
+var cliFlag = (name) => CLI_ARGS.includes(`--${name}`);
+var cliValue = (name, fallback = null) => {
+  const inline = CLI_ARGS.find((arg) => arg.startsWith(`--${name}=`));
+  if (inline) return inline.slice(name.length + 3);
+  const index = CLI_ARGS.indexOf(`--${name}`);
+  if (index >= 0 && CLI_ARGS[index + 1] && !CLI_ARGS[index + 1].startsWith("--")) return CLI_ARGS[index + 1];
+  return fallback;
+};
+var USE_TEMP_PROFILE = cliFlag("temp-profile");
+var PROFILE_DIR = path.resolve(cliValue("profile", "./chatgpt_profile"));
 var TRACE_ENABLED = process.env.TRACE !== "0";
 var TRACE_ASSETS = process.env.TRACE_ASSETS === "1";
 var TRACE_TELEMETRY = process.env.TRACE_TELEMETRY === "1";
@@ -5121,7 +5132,65 @@ function classifyRequestFailure({ errorText = "", type = "", url = null }) {
   if (!url && type === "Document") return { relevant: true, host: null };
   return { relevant: false, reason: "third-party host", host: host || null };
 }
+var PERSISTENT_COOKIE_EXPIRY = () => Math.floor(Date.now() / 1e3) + 30 * 24 * 60 * 60;
 var MAX_COOKIE_BYTES = 4096;
+function clearStaleProfileLocks(profileDir) {
+  const removed = [];
+  for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+    const target = path.join(profileDir, name);
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      removed.push(name);
+    } catch {
+    }
+  }
+  return removed;
+}
+async function closeBrowserGracefully(cdp, chrome, timeoutMs = 4e3) {
+  try {
+    if (cdp?.isAlive?.()) {
+      await cdp.send("Browser.close", {}, null, timeoutMs);
+    }
+  } catch {
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (chrome && chrome.exitCode === null && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (chrome && chrome.exitCode === null) {
+    try {
+      chrome.kill();
+    } catch {
+    }
+  }
+}
+async function installSessionCookieFamily(cdp, cookies) {
+  const installed = [];
+  for (const cookie of Array.isArray(cookies) ? cookies : []) {
+    const name = cookie?.name;
+    const value = cookie?.value;
+    if (!name || typeof value !== "string" || !value.length) continue;
+    if (name === COOKIE_NAME) continue;
+    const domain = cookie.domain || ".chatgpt.com";
+    try {
+      const result = await cdp.send("Network.setCookie", {
+        name,
+        value,
+        domain,
+        path: cookie.path || "/",
+        secure: cookie.secure !== false,
+        httpOnly: !!cookie.httpOnly,
+        sameSite: cookie.sameSite || "Lax",
+        // Without an expiry Chrome treats it as a session cookie and never
+        // writes it to disk, so a persistent profile would lose it on exit.
+        expires: typeof cookie.expires === "number" ? cookie.expires : PERSISTENT_COOKIE_EXPIRY()
+      });
+      if (result?.success !== false) installed.push(`${name}@${domain}`);
+    } catch {
+    }
+  }
+  return installed;
+}
 async function installSessionCookie(cdp, sessionToken) {
   if (sessionToken.length + COOKIE_NAME.length + 1 > MAX_COOKIE_BYTES) return false;
   try {
@@ -5132,7 +5201,8 @@ async function installSessionCookie(cdp, sessionToken) {
       path: "/",
       secure: true,
       httpOnly: true,
-      sameSite: "Lax"
+      sameSite: "Lax",
+      expires: PERSISTENT_COOKIE_EXPIRY()
     });
     return result?.success !== false;
   } catch {
@@ -5196,7 +5266,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 }
 async function main() {
   console.log("\n" + "=".repeat(60));
-  console.log("  \u{1F3AF} ChatGPT Smart (v9.2 - Isolated Recovery Race)");
+  console.log("  \u{1F3AF} ChatGPT Smart (v9.3 - Persistent Login Profile)");
   console.log("=".repeat(60) + "\n");
   const diagnosticsPath = path.join(os.tmpdir(), "chatgpt_proxy_diagnostics.jsonl");
   try {
@@ -5267,10 +5337,16 @@ async function main() {
     console.error("\u274C Chrome not found");
     process.exit(1);
   }
-  const userDir = path.join(os.tmpdir(), `real_chrome_${Date.now()}`);
-  fs.mkdirSync(userDir);
+  const userDir = USE_TEMP_PROFILE ? path.join(os.tmpdir(), `real_chrome_${Date.now()}`) : PROFILE_DIR;
+  const profileIsNew = !fs.existsSync(path.join(userDir, "Default"));
+  fs.mkdirSync(userDir, { recursive: true });
   fs.mkdirSync(path.join(userDir, "Default"), { recursive: true });
-  fs.writeFileSync(path.join(userDir, "Default", "Preferences"), JSON.stringify({
+  console.log(`  \u{1F4C1} Profile: ${USE_TEMP_PROFILE ? "temporary (discarded on exit)" : userDir}`);
+  if (!USE_TEMP_PROFILE && profileIsNew) {
+    console.log("     First run for this profile. Use --login once to sign in normally,");
+    console.log("     so the complete cookie family is stored and survives IP changes.");
+  }
+  if (profileIsNew) fs.writeFileSync(path.join(userDir, "Default", "Preferences"), JSON.stringify({
     profile: {
       exit_type: "Normal",
       exited_cleanly: true,
@@ -5363,16 +5439,14 @@ async function main() {
   }
   args.push("about:blank");
   console.log("\n  \u{1F680} Opening Chrome...");
-  const chrome = spawn(chromePath, args, { stdio: "ignore" });
+  let chrome = spawn(chromePath, args, { stdio: "ignore" });
   await sleep(800);
   let cleaning = false;
+  let gracefulCdp = null;
   const cleanup = () => {
     if (cleaning) return;
     cleaning = true;
-    try {
-      chrome.kill();
-    } catch {
-    }
+    void closeBrowserGracefully(gracefulCdp, chrome);
     if (proxyHandle) proxyHandle.close();
     if (sharedRL) {
       try {
@@ -5380,25 +5454,60 @@ async function main() {
       } catch {
       }
     }
-    setTimeout(() => {
-      try {
-        fs.rmSync(userDir, { recursive: true, force: true });
-      } catch {
-      }
-    }, 1e3);
+    if (USE_TEMP_PROFILE) {
+      setTimeout(() => {
+        try {
+          fs.rmSync(userDir, { recursive: true, force: true });
+        } catch {
+        }
+      }, 1e3);
+    }
   };
-  process.on("SIGINT", () => {
-    console.log("\n  \u{1F44B} Shutting down...");
-    cleanup();
-    process.exit(0);
-  });
-  const ws = await connectCDP(cdpPort);
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, async () => {
+      console.log("\n  \u{1F44B} Shutting down...");
+      cleaning = true;
+      await closeBrowserGracefully(gracefulCdp, chrome, 3e3);
+      if (proxyHandle) proxyHandle.close();
+      if (sharedRL) {
+        try {
+          sharedRL.close();
+        } catch {
+        }
+      }
+      if (USE_TEMP_PROFILE) {
+        try {
+          fs.rmSync(userDir, { recursive: true, force: true });
+        } catch {
+        }
+      }
+      process.exit(0);
+    });
+  }
+  let ws = await connectCDP(cdpPort);
+  if (!ws && !USE_TEMP_PROFILE) {
+    const removed = clearStaleProfileLocks(userDir);
+    console.log(`  \u267B\uFE0F  Debugging port unavailable; cleared stale profile locks (${removed.join(", ") || "none"}) and retrying once...`);
+    try {
+      chrome.kill();
+    } catch {
+    }
+    await sleep(1200);
+    chrome = spawn(chromePath, args, { stdio: "ignore" });
+    await sleep(1200);
+    ws = await connectCDP(cdpPort);
+  }
   if (!ws) {
-    console.error("\u274C CDP failed");
+    console.error("\u274C Could not attach to Chrome.");
+    if (!USE_TEMP_PROFILE) {
+      console.error(`   Close any Chrome window still using ${userDir}, then run again.`);
+      console.error("   Or start with --temp-profile to ignore the saved profile.");
+    }
     cleanup();
     process.exit(1);
   }
   const cdp = cdpClient(ws);
+  gracefulCdp = cdp;
   try {
     await cdp.send("Network.enable");
     await cdp.send("Page.enable");
@@ -5735,9 +5844,23 @@ async function main() {
     }, `\u{1F4CA} requests ${requestCounter} total | ${successCounter} ok | ${injectedCounter} cookie-injected | ${timeoutCounter} timeout | ${errorCounter} error | ${pausedRequests.size} paused`);
   }, 15e3);
   console.log("  \u2705 Interceptor ready (request rescue: 8s, verbose logging on)\n");
-  const cookieInstalled = await installSessionCookie(cdp, sessionToken);
-  console.log(`  \u{1F36A} Session cookie: ${cookieInstalled ? "stored in Chrome" : "header injection fallback"}`);
-  trace("session_cookie_install", { success: cookieInstalled, cookieSize });
+  const existingJarCookies = await readSessionCookies(cdp);
+  if (existingJarCookies.length) {
+    console.log("  \u{1F36A} Session cookie: already present in this profile (no injection needed)");
+    trace("session_cookie_from_profile", { count: existingJarCookies.length });
+  } else {
+    const cookieInstalled = await installSessionCookie(cdp, sessionToken);
+    console.log(`  \u{1F36A} Session cookie: ${cookieInstalled ? "stored in Chrome" : "header injection fallback"}`);
+    trace("session_cookie_install", { success: cookieInstalled, cookieSize });
+  }
+  const extraCookies = await installSessionCookieFamily(cdp, apiSession.cookies);
+  if (extraCookies.length) {
+    console.log(`  \u{1F36A} Additional login cookies installed: ${extraCookies.length}`);
+    trace("session_cookie_family_installed", { cookies: extraCookies });
+  } else if (!existingJarCookies.length) {
+    console.log("  \u26A0\uFE0F Only the NextAuth token is available; ChatGPT may ask to pick the account after an IP change.");
+    console.log('     Run "node chatgpt_smart --login" once to store the full login state in the profile.');
+  }
   console.log("  \u{1F310} Navigating to chatgpt.com...");
   await cdp.send("Page.navigate", { url: "https://chatgpt.com/" });
   await waitForChatGPTDocument(3e3, null, null, { idleGraceMs: 4e3 });
@@ -6875,10 +6998,12 @@ async function diagnosticMain() {
     console.log(`
   \u2705 Diagnostic recording saved: ${diagnosticPath}`);
   };
-  process.on("SIGINT", () => {
-    stop();
-    process.exit(0);
-  });
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+      stop();
+      process.exit(0);
+    });
+  }
   ws = await connectCDP(cdpPort);
   if (!ws) throw new Error("Could not attach to Chrome");
   const cdp = cdpClient(ws);
@@ -7170,7 +7295,75 @@ async function diagnosticMain() {
   while (cdp.isAlive() && !stopping) await sleep(1e3);
   stop();
 }
-var selectedMain = process.argv.includes("--diagnose") ? diagnosticMain : main;
+async function loginMain() {
+  console.log("\n" + "=".repeat(68));
+  console.log("  \u{1F510} ChatGPT Manual Login (stores the complete session in a profile)");
+  console.log("=".repeat(68));
+  console.log("  Nothing is injected here. Sign in exactly like a normal browser so");
+  console.log("  ChatGPT stores its full cookie family, not just the NextAuth token.\n");
+  console.log(`  \u{1F4C1} Profile: ${PROFILE_DIR}`);
+  const chromePath = findChrome();
+  if (!chromePath) throw new Error("Chrome not found");
+  fs.mkdirSync(path.join(PROFILE_DIR, "Default"), { recursive: true });
+  const cdpPort = 9300 + Math.floor(Math.random() * 250);
+  const chrome = spawn(chromePath, [
+    `--remote-debugging-port=${cdpPort}`,
+    `--user-data-dir=${PROFILE_DIR}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--start-maximized",
+    "https://chatgpt.com/"
+  ], { stdio: "ignore" });
+  let stopping = false;
+  const timers = [];
+  let loginCdp = null;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    for (const timer of timers) clearInterval(timer);
+    await closeBrowserGracefully(loginCdp, chrome);
+    console.log("\n  \u2705 Login state saved in the profile. Start the tool with:");
+    console.log("     node chatgpt_smart\n");
+  };
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+      void stop().then(() => process.exit(0));
+    });
+  }
+  const ws = await connectCDP(cdpPort);
+  if (!ws) throw new Error("Could not attach to Chrome");
+  const cdp = cdpClient(ws);
+  loginCdp = cdp;
+  await cdp.send("Network.enable");
+  console.log("  \u25B6 Sign in, then press Ctrl+C here once you see your account.\n");
+  const authCookiePattern = /^(?:__Secure-next-auth\.session-token|_account|unified_session_manifest|usc_|oai-client-auth-|auth-session-minimized|login_session|auth_provider)/;
+  let lastSummary = "";
+  timers.push(setInterval(async () => {
+    if (stopping || !cdp.isAlive()) return;
+    try {
+      const result = await cdp.send("Network.getCookies", {
+        urls: ["https://chatgpt.com/", "https://auth.openai.com/"]
+      });
+      const relevant = (result.cookies || []).filter((cookie) => authCookiePattern.test(cookie.name)).map((cookie) => cookie.name).sort();
+      const summary = relevant.join(",");
+      if (summary && summary !== lastSummary) {
+        lastSummary = summary;
+        const hasSession = relevant.some((name) => name.startsWith("__Secure-next-auth.session-token"));
+        const hasAccount = relevant.includes("_account");
+        const hasManifest = relevant.some((name) => name.startsWith("unified_session_manifest") || name.startsWith("usc_"));
+        console.log(`  \u{1F36A} stored: ${relevant.join(", ")}`);
+        if (hasSession && hasAccount && hasManifest) {
+          console.log("  \u2705 Full login state detected (session + account + unified manifest).");
+          console.log("     This is what survives a proxy country change. Press Ctrl+C to finish.");
+        }
+      }
+    } catch {
+    }
+  }, 1e3));
+  while (cdp.isAlive() && !stopping) await sleep(1e3);
+  await stop();
+}
+var selectedMain = cliFlag("diagnose") ? diagnosticMain : cliFlag("login") ? loginMain : main;
 selectedMain().catch((e) => {
   console.error("\n\u274C Fatal:", e.stack || e.message);
   process.exit(1);
