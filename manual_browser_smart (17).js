@@ -1642,73 +1642,74 @@ async function main() {
     }
   }
 
-  // Probes run in the page context, and Chrome's network error page rejects
-  // every fetch with a chrome-error scheme error. Move to a blank page first so
-  // the route check measures the proxy instead of the error page.
-  async function ensureProbeableContext() {
-    try {
-      const res = await cdp.send('Runtime.evaluate', {
-        expression: `JSON.stringify({protocol: location.protocol, host: location.hostname})`,
-        returnByValue: true, timeout: 3000
-      });
-      const location = JSON.parse(res.result?.value || '{}');
-      const brokenPage = /^chrome-error:/i.test(location.protocol || '') ||
-        location.host === 'chromewebdata';
-      if (!brokenPage) return false;
-      trace('probe_context_reset', { protocol: location.protocol, host: location.host },
-        '🧹 leaving Chrome error page so route probes can run');
-      await cdp.send('Page.navigate', { url: 'about:blank' });
-      await sleep(400);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   // Waits for a usable route. A changed exit country is preferred, but an
   // unchanged one still counts once the change window passes, so an auth-only
-  // failure is not stuck waiting for a country that never changes.
+  // failure is not stuck waiting for a country that never changes. The probe
+  // owns a disposable target so a Chrome error page remains untouched.
   async function waitForHealthyProxyRoute(previousCountry, timeoutMs = 120000, changeWindowMs = 6000) {
-    await ensureProbeableContext();
     const startedProbingAt = Date.now();
     const deadline = startedProbingAt + timeoutMs;
     let probeNumber = 0;
     let lastHealthy = null;
+    let targetId = null;
 
-    while (Date.now() < deadline && cdp.isAlive() && !cleaning) {
-      probeNumber++;
-      setRecoveryState('probing-route');
-      // Each attempt gives the route more time, so a genuinely slow proxy is
-      // not written off as unreachable.
-      const providerBudget = Math.min(4000 + (probeNumber - 1) * 3000, 20000);
-      const route = await probeExitCountry(cdp, null, providerBudget);
-      const changed = route.ok && (!previousCountry || route.country !== previousCountry);
-      trace('proxy_route_probe', {
-        probeNumber,
-        ok: !!route.ok,
-        country: route.country || null,
-        provider: route.provider || null,
-        changed,
-        providerBudgetMs: providerBudget,
-        elapsedMs: route.elapsedMs,
-        error: route.error || null
-      }, `🛰️  route probe #${probeNumber} ${route.ok ? route.country : `unreachable (budget ${providerBudget}ms)`}${route.ok && !changed ? ' (unchanged)' : ''} ${route.elapsedMs}ms`);
+    try {
+      const target = await cdp.send('Target.createTarget', {
+        url: 'about:blank',
+        background: true
+      });
+      targetId = target.targetId;
+      const attached = await cdp.send('Target.attachToTarget', {
+        targetId,
+        flatten: true
+      });
+      const probeSessionId = attached.sessionId;
+      await cdp.send('Runtime.enable', {}, probeSessionId);
+      try { await cdp.send('Page.setBypassCSP', { enabled: true }, probeSessionId); } catch {}
 
-      if (changed) return { ...route, changed: true };
-      if (route.ok) {
-        lastHealthy = route;
-        if (Date.now() - startedProbingAt >= changeWindowMs) {
-          trace('proxy_route_unchanged_accepted', {
-            country: route.country,
-            previousCountry,
-            waitedMs: Date.now() - startedProbingAt
-          }, `🛰️  exit country stayed ${route.country}; continuing recovery`);
-          return { ...route, changed: false };
+      while (Date.now() < deadline && cdp.isAlive() && !cleaning) {
+        probeNumber++;
+        setRecoveryState('probing-route');
+        // Each attempt gives the route more time, so a genuinely slow proxy is
+        // not written off as unreachable.
+        const providerBudget = Math.min(4000 + (probeNumber - 1) * 3000, 20000);
+        const route = await probeExitCountry(cdp, probeSessionId, providerBudget);
+        const changed = route.ok && (!previousCountry || route.country !== previousCountry);
+        trace('proxy_route_probe', {
+          probeNumber,
+          isolated: true,
+          ok: !!route.ok,
+          country: route.country || null,
+          provider: route.provider || null,
+          changed,
+          providerBudgetMs: providerBudget,
+          elapsedMs: route.elapsedMs,
+          error: route.error || null
+        }, `🛰️  isolated route probe #${probeNumber} ${route.ok ? route.country : `unreachable (budget ${providerBudget}ms)`}${route.ok && !changed ? ' (unchanged)' : ''} ${route.elapsedMs}ms`);
+
+        if (changed) return { ...route, changed: true };
+        if (route.ok) {
+          lastHealthy = route;
+          if (Date.now() - startedProbingAt >= changeWindowMs) {
+            trace('proxy_route_unchanged_accepted', {
+              country: route.country,
+              previousCountry,
+              waitedMs: Date.now() - startedProbingAt
+            }, `🛰️  exit country stayed ${route.country}; continuing recovery`);
+            return { ...route, changed: false };
+          }
         }
+        await sleep(800);
       }
-      await sleep(800);
+      return lastHealthy ? { ...lastHealthy, changed: false } : null;
+    } catch (error) {
+      trace('isolated_route_probe_failed', { error: error.message });
+      return lastHealthy ? { ...lastHealthy, changed: false } : null;
+    } finally {
+      if (targetId) {
+        try { await cdp.send('Target.closeTarget', { targetId }); } catch {}
+      }
     }
-    return lastHealthy ? { ...lastHealthy, changed: false } : null;
   }
 
   async function benchmarkChatGPTRoute(stage) {
@@ -2213,100 +2214,55 @@ async function main() {
 
     activeRouteCountry = route.country;
 
-    // An IP service proves only generic internet access. Test ChatGPT itself
-    // without navigating or rendering before touching cache, cookies, or the
-    // visible page. A stale pooled tunnel gets exactly one inexpensive reset.
-    setRecoveryState('probing-chatgpt');
-    let readiness = await benchmarkChatGPTRoute('existing connection pool');
-    let readinessAction = selectReadinessRecovery(readiness, true, false);
-    if (readinessAction === 'reopen-connection-pool') {
-      trace('chatgpt_readiness_recovery', {
-        action: readinessAction,
-        state: readiness.state
-      }, '🔌 generic internet works but ChatGPT does not; reopening idle connections once');
-      try { await cdp.send('Network.closeIdleConnections'); } catch {}
-      readiness = await benchmarkChatGPTRoute('fresh connection pool');
-      readinessAction = selectReadinessRecovery(readiness, true, true);
-    }
-    if (readinessAction === 'reject-chatgpt-endpoint') {
-      console.log('  ⚠️ This proxy has internet access but its ChatGPT endpoints did not answer.');
-      console.log('     No cookies/cache were cleared and the visible page was not reloaded.');
-      console.log('     Select another proxy endpoint, then retry.');
+    // Capture the intended destination without changing it. Every request below
+    // is scoped to a disposable CDP session until a strategy has twice verified
+    // an authenticated response from the new exit country.
+    const visibleLocation = await currentPageLocation();
+    setRecoveryState('isolated-recovery-race');
+    trace('isolated_recovery_race_start', {
+      routeCountry: route.country,
+      visiblePage: `${visibleLocation.path}${visibleLocation.hash}`
+    }, `🏁 racing isolated ChatGPT recovery paths for ${route.country}`);
+
+    let winner;
+    try {
+      winner = await runIsolatedChatGPTRecovery(cdp, {
+        expectedCountry: route.country,
+        timeoutMs: 90000,
+        targetReadyTimeoutMs: 30000,
+        trace: (event, details) => trace(event, details,
+          event === 'recovery_race_winner'
+            ? `🏆 ${details.strategy} verified authenticated ${details.country} in ${details.elapsedMs}ms`
+            : null)
+      });
+    } catch (error) {
+      console.log(`  ⚠️ No background strategy verified an authenticated ${route.country} session.`);
+      console.log('     The visible page and rotating browser cookie were left untouched.');
       console.log(`     Diagnostics: ${diagnosticsPath}\n`);
       trace('recovery_failed', {
-        stage: 'chatgpt_endpoint_unreachable',
+        stage: 'isolated_recovery_race',
         routeCountry: route.country,
-        readiness: readiness.state,
-        probes: readiness.results
+        error: error.message
       });
       return null;
     }
 
-    // Persisting the cookie is essential: header injection authenticates a
-    // request but does not populate Chrome's cookie jar after an IP change.
-    await ensureSessionCookiePresent('recovery');
+    // The race never writes, deletes, or injects a session cookie. Sync only
+    // observes the browser-managed value that won; restoration remains
+    // missing-cookie-only.
+    await syncActiveSessionCookie(`recovery race winner ${winner.strategy}`);
+    await ensureSessionCookiePresent('after isolated recovery winner');
 
-    // With the tab on an error/blank page every in-page probe fails, so the
-    // pre-checks are skipped and the single navigation happens right away.
-    const pageBefore = await currentPageLocation();
-    if (!pageBefore.onChatGPT) {
-      trace('recovery_skipping_precheck', { reason: 'page is not a chatgpt.com document' },
-        '↷ page is not on chatgpt.com; warming the route before reloading it');
-
-      // Absorb the slow first request through the new proxy in a background tab
-      // so the visible tab does not sit on an error page while it happens.
-      setRecoveryState('releasing-old-region');
-      await releaseOldRegionState('before_warmup');
-      setRecoveryState('background-warmup');
-      await warmUpChatGPTInBackground(route.country, 15000);
-      await ensureSessionCookiePresent('after warmup');
-      return navigateOnceAndVerify(route, { path: '/', hash: '' });
-    }
-
-    setRecoveryState('verifying-current-page');
-    const current = await verifyStableSession();
-    trace('current_page_verification', {
-      ok: current.ok,
-      loggedIn: !!current.state?.loggedIn,
-      status: current.state?.status || 0,
-      country: current.state?.country || null,
-      challenge: !!current.state?.challenge,
-      routeCountry: route.country
-    }, `🔍 current page: loggedIn=${!!current.state?.loggedIn} me=${current.state?.status || 0} country=${current.state?.country || '?'}${current.state?.challenge ? ' challenge=yes' : ''}`);
-    if (current.ok && current.state.country === route.country) {
-      return acceptRecovery(current.state, route, 'no_navigation');
-    }
-
-    // Drop the Cloudflare/device cookies issued for the previous exit IP,
-    // otherwise ChatGPT keeps serving the old region and its currency.
-    setRecoveryState('releasing-old-region');
-    await releaseOldRegionState('before_warmup');
-
-    // ChatGPT uses the first document request after an IP change to rebuild the
-    // regional edge session. Do that request in a background target so the
-    // visible tab never shows the logged-out intermediate state.
-    setRecoveryState('background-warmup');
-    trace('background_warmup_started', { routeCountry: route.country },
-      '🔥 priming ChatGPT session in a background tab');
-    await warmUpChatGPTInBackground(route.country);
-    await ensureSessionCookiePresent('after warmup');
-
-    const afterWarmup = await verifyStableSession();
-    trace('warmup_verification', {
-      ok: afterWarmup.ok,
-      loggedIn: !!afterWarmup.state?.loggedIn,
-      status: afterWarmup.state?.status || 0,
-      country: afterWarmup.state?.country || null,
-      challenge: !!afterWarmup.state?.challenge,
-      routeCountry: route.country
-    }, `🔍 after warm-up: loggedIn=${!!afterWarmup.state?.loggedIn} me=${afterWarmup.state?.status || 0} country=${afterWarmup.state?.country || '?'}${afterWarmup.state?.challenge ? ' challenge=yes' : ''}`);
-    if (afterWarmup.ok && afterWarmup.state.country === route.country) {
-      return acceptRecovery(afterWarmup.state, route, 'background_warmup');
-    }
-
-    // Only now, after the proxy, cookies, and edge session are ready, perform
-    // the single visible navigation. There is no blind visible retry loop.
-    return navigateOnceAndVerify(route, await currentPageLocation());
+    trace('visible_navigation_released', {
+      winner: winner.strategy,
+      verifiedCountry: winner.verification.country,
+      waitedMs: winner.elapsedMs
+    }, `🔓 background winner verified; visible navigation is now allowed`);
+    return navigateOnceAndVerify(
+      route,
+      visibleLocation.onChatGPT ? visibleLocation : { path: '/', hash: '' },
+      1
+    );
   }
 
   function acceptRecovery(state, route, mode) {
