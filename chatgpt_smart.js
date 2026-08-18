@@ -8,9 +8,9 @@ var __commonJS = (cb, mod) => function __require() {
   }
 };
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/constants.js
+// node_modules/ws/lib/constants.js
 var require_constants = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/constants.js"(exports2, module2) {
+  "node_modules/ws/lib/constants.js"(exports2, module2) {
     "use strict";
     var BINARY_TYPES = ["nodebuffer", "arraybuffer", "fragments"];
     var hasBlob = typeof Blob !== "undefined";
@@ -31,9 +31,9 @@ var require_constants = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/buffer-util.js
+// node_modules/ws/lib/buffer-util.js
 var require_buffer_util = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/buffer-util.js"(exports2, module2) {
+  "node_modules/ws/lib/buffer-util.js"(exports2, module2) {
     "use strict";
     var { EMPTY_BUFFER } = require_constants();
     var FastBuffer = Buffer[Symbol.species];
@@ -106,9 +106,9 @@ var require_buffer_util = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/limiter.js
+// node_modules/ws/lib/limiter.js
 var require_limiter = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/limiter.js"(exports2, module2) {
+  "node_modules/ws/lib/limiter.js"(exports2, module2) {
     "use strict";
     var kDone = /* @__PURE__ */ Symbol("kDone");
     var kRun = /* @__PURE__ */ Symbol("kRun");
@@ -156,9 +156,9 @@ var require_limiter = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/permessage-deflate.js
+// node_modules/ws/lib/permessage-deflate.js
 var require_permessage_deflate = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/permessage-deflate.js"(exports2, module2) {
+  "node_modules/ws/lib/permessage-deflate.js"(exports2, module2) {
     "use strict";
     var zlib = require("zlib");
     var bufferUtil = require_buffer_util();
@@ -539,9 +539,9 @@ var require_permessage_deflate = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/validation.js
+// node_modules/ws/lib/validation.js
 var require_validation = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/validation.js"(exports2, module2) {
+  "node_modules/ws/lib/validation.js"(exports2, module2) {
     "use strict";
     var { isUtf8 } = require("buffer");
     var { hasBlob } = require_constants();
@@ -740,9 +740,9 @@ var require_validation = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/receiver.js
+// node_modules/ws/lib/receiver.js
 var require_receiver = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/receiver.js"(exports2, module2) {
+  "node_modules/ws/lib/receiver.js"(exports2, module2) {
     "use strict";
     var { Writable } = require("stream");
     var PerMessageDeflate = require_permessage_deflate();
@@ -1363,9 +1363,9 @@ var require_receiver = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/sender.js
+// node_modules/ws/lib/sender.js
 var require_sender = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/sender.js"(exports2, module2) {
+  "node_modules/ws/lib/sender.js"(exports2, module2) {
     "use strict";
     var { Duplex } = require("stream");
     var { randomFillSync } = require("crypto");
@@ -1856,9 +1856,9 @@ var require_sender = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/event-target.js
+// node_modules/ws/lib/event-target.js
 var require_event_target = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/event-target.js"(exports2, module2) {
+  "node_modules/ws/lib/event-target.js"(exports2, module2) {
     "use strict";
     var { kForOnEventAttribute, kListener } = require_constants();
     var kCode = /* @__PURE__ */ Symbol("kCode");
@@ -2085,9 +2085,9 @@ var require_event_target = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/extension.js
+// node_modules/ws/lib/extension.js
 var require_extension = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/extension.js"(exports2, module2) {
+  "node_modules/ws/lib/extension.js"(exports2, module2) {
     "use strict";
     var { tokenChars } = require_validation();
     function push(dest, name, elem) {
@@ -2238,9 +2238,9 @@ var require_extension = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/websocket.js
+// node_modules/ws/lib/websocket.js
 var require_websocket = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/websocket.js"(exports2, module2) {
+  "node_modules/ws/lib/websocket.js"(exports2, module2) {
     "use strict";
     var EventEmitter = require("events");
     var https = require("https");
@@ -3134,9 +3134,9 @@ var require_websocket = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/stream.js
+// node_modules/ws/lib/stream.js
 var require_stream = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/stream.js"(exports2, module2) {
+  "node_modules/ws/lib/stream.js"(exports2, module2) {
     "use strict";
     var WebSocket2 = require_websocket();
     var { Duplex } = require("stream");
@@ -3232,9 +3232,9 @@ var require_stream = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/subprotocol.js
+// node_modules/ws/lib/subprotocol.js
 var require_subprotocol = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/subprotocol.js"(exports2, module2) {
+  "node_modules/ws/lib/subprotocol.js"(exports2, module2) {
     "use strict";
     var { tokenChars } = require_validation();
     function parse(header) {
@@ -3277,9 +3277,9 @@ var require_subprotocol = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/lib/websocket-server.js
+// node_modules/ws/lib/websocket-server.js
 var require_websocket_server = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/lib/websocket-server.js"(exports2, module2) {
+  "node_modules/ws/lib/websocket-server.js"(exports2, module2) {
     "use strict";
     var EventEmitter = require("events");
     var http2 = require("http");
@@ -3678,9 +3678,9 @@ var require_websocket_server = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/node_modules/ws/index.js
+// node_modules/ws/index.js
 var require_ws = __commonJS({
-  "../tmp/chatgpt-bundle-build/node_modules/ws/index.js"(exports2, module2) {
+  "node_modules/ws/index.js"(exports2, module2) {
     "use strict";
     var createWebSocketStream = require_stream();
     var extension = require_extension();
@@ -3703,9 +3703,9 @@ var require_ws = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/chatgpt_readiness.js
+// chatgpt_readiness.js
 var require_chatgpt_readiness = __commonJS({
-  "../tmp/chatgpt-bundle-build/chatgpt_readiness.js"(exports2, module2) {
+  "chatgpt_readiness.js"(exports2, module2) {
     var CHATGPT_READINESS_PROBES = Object.freeze([
       { name: "edge", url: "https://chatgpt.com/cdn-cgi/trace", kind: "edge" },
       { name: "session", url: "https://chatgpt.com/api/auth/session", kind: "api" },
@@ -3814,9 +3814,9 @@ var require_chatgpt_readiness = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/recovery_race.js
+// recovery_race.js
 var require_recovery_race = __commonJS({
-  "../tmp/chatgpt-bundle-build/recovery_race.js"(exports2, module2) {
+  "recovery_race.js"(exports2, module2) {
     "use strict";
     var defaultNow = () => Date.now();
     async function raceRecoveryStrategies({
@@ -3942,9 +3942,9 @@ var require_recovery_race = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/isolated_chatgpt_recovery.js
+// isolated_chatgpt_recovery.js
 var require_isolated_chatgpt_recovery = __commonJS({
-  "../tmp/chatgpt-bundle-build/isolated_chatgpt_recovery.js"(exports2, module2) {
+  "isolated_chatgpt_recovery.js"(exports2, module2) {
     "use strict";
     var { raceRecoveryStrategies } = require_recovery_race();
     var sleep2 = (ms, signal) => new Promise((resolve, reject) => {
@@ -4198,9 +4198,9 @@ var require_isolated_chatgpt_recovery = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/isolated_checkout.js
+// isolated_checkout.js
 var require_isolated_checkout = __commonJS({
-  "../tmp/chatgpt-bundle-build/isolated_checkout.js"(exports2, module2) {
+  "isolated_checkout.js"(exports2, module2) {
     var crypto2 = require("crypto");
     var CHATGPT_ORIGIN = "https://chatgpt.com";
     var COUNTRY_PROVIDERS = [
@@ -4623,7 +4623,7 @@ var require_isolated_checkout = __commonJS({
   }
 });
 
-// ../tmp/chatgpt-bundle-build/manual_browser_smart (17).js
+// manual_browser_smart (17).js
 var { spawn } = require("child_process");
 var http = require("http");
 var WebSocket = require_ws();
@@ -5196,7 +5196,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 }
 async function main() {
   console.log("\n" + "=".repeat(60));
-  console.log("  \u{1F3AF} ChatGPT Manual Browser Smart (v9.1 - Isolated Recovery Race)");
+  console.log("  \u{1F3AF} ChatGPT Smart (v9.2 - Isolated Recovery Race)");
   console.log("=".repeat(60) + "\n");
   const diagnosticsPath = path.join(os.tmpdir(), "chatgpt_proxy_diagnostics.jsonl");
   try {
@@ -5517,7 +5517,7 @@ async function main() {
       requestId: params.requestId,
       status: response.status,
       type,
-      url: response.url,
+      url: safeUrl(response.url),
       remoteIP: response.remoteIPAddress || null,
       protocol: response.protocol || null,
       fromDiskCache: !!response.fromDiskCache,
@@ -5573,7 +5573,7 @@ async function main() {
     }
     pageIsChatGPT = host === "chatgpt.com" && !params.frame?.unreachableUrl;
     trace("frame_navigated", {
-      url: params.frame?.url,
+      url: safeUrl(params.frame?.url),
       host,
       status: params.frame?.unreachableUrl ? "unreachable" : "ok"
     }, `\u{1F9ED} navigated ${shortenUrl(params.frame?.url || "")}`);
@@ -6764,7 +6764,414 @@ async function main() {
   cleanup();
   process.exit(0);
 }
-main().catch((e) => {
-  console.error("\n\u274C Fatal:", e.message);
+async function diagnosticMain() {
+  console.log("\n" + "=".repeat(68));
+  console.log("  \u{1F52C} ChatGPT Manual Diagnostic Recorder (passive mode)");
+  console.log("=".repeat(68));
+  console.log("  This mode does NOT inject cookies, reload pages, recover sessions,");
+  console.log("  create checkout links, clear cache, or change browser state.\n");
+  const runStamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+  const diagnosticPath = path.resolve(`chatgpt_manual_diagnostic_${runStamp}.jsonl`);
+  fs.writeFileSync(diagnosticPath, "");
+  const started = Date.now();
+  const emit = (event, details = {}, terminal = null) => {
+    const record = {
+      at: (/* @__PURE__ */ new Date()).toISOString(),
+      sinceStartMs: Date.now() - started,
+      event,
+      ...details
+    };
+    try {
+      fs.appendFileSync(diagnosticPath, JSON.stringify(record) + "\n");
+    } catch {
+    }
+    if (terminal) console.log(`  ${((Date.now() - started) / 1e3).toFixed(3).padStart(9)}s ${terminal}`);
+  };
+  const cookieSummary = (raw) => {
+    const values = String(raw || "").split(/;\s*/).filter(Boolean);
+    return values.map((item) => {
+      const eq = item.indexOf("=");
+      const name = eq >= 0 ? item.slice(0, eq).trim() : item.trim();
+      const value = eq >= 0 ? item.slice(eq + 1) : "";
+      return { name, bytes: value.length, fingerprint: fingerprint(value) };
+    });
+  };
+  const setCookieSummary = (raw) => String(raw || "").split("\n").filter(Boolean).map((line) => {
+    const pair = line.split(";")[0];
+    const eq = pair.indexOf("=");
+    const name = eq >= 0 ? pair.slice(0, eq).trim() : pair.trim();
+    const value = eq >= 0 ? pair.slice(eq + 1) : "";
+    return { name, bytes: value.length, fingerprint: fingerprint(value), clears: value.length === 0 };
+  });
+  const sensitiveQueryName = /token|auth|verify|signature|sig|secret|password|session|jwt|code|state|key|credential|ticket/i;
+  const safeUrl2 = (raw) => {
+    try {
+      const parsed = new URL(String(raw || ""));
+      parsed.pathname = parsed.pathname.split("/").map(
+        (segment) => segment.length > 120 ? `<redacted-path:${segment.length}b:${fingerprint(segment)}>` : segment
+      ).join("/");
+      for (const [name, value] of [...parsed.searchParams.entries()]) {
+        if (sensitiveQueryName.test(name) || /(?:^|_)(?:tk|nonce)(?:$|_)/i.test(name) || value.length > 80) {
+          parsed.searchParams.set(name, `<redacted:${value.length}b:${fingerprint(value)}>`);
+        }
+      }
+      return parsed.toString();
+    } catch {
+      return String(raw || "").slice(0, 1e3);
+    }
+  };
+  const safeHeaders = (headers) => {
+    const result = {};
+    for (const [name, value] of Object.entries(headers || {})) {
+      const lower = name.toLowerCase();
+      if (lower === "cookie") result[name] = cookieSummary(value);
+      else if (lower === "set-cookie") result[name] = setCookieSummary(value);
+      else if (lower === "authorization" || lower === "proxy-authorization") {
+        result[name] = `<redacted ${String(value).length}b fp=${fingerprint(value)}>`;
+      } else if (lower === "referer" || lower === "location") result[name] = safeUrl2(value);
+      else result[name] = String(value).slice(0, 500);
+    }
+    return result;
+  };
+  console.log(`  \u{1F5C2}\uFE0F  Recording everything to: ${diagnosticPath}`);
+  console.log("  1) Log in to ChatGPT manually");
+  console.log("  2) Install/connect the proxy extension in another tab");
+  console.log("  3) Return to ChatGPT and press Refresh once");
+  console.log("  4) Wait until the result is visible, then press Ctrl+C here\n");
+  const chromePath = findChrome();
+  if (!chromePath) throw new Error("Chrome not found");
+  const userDir = path.join(os.tmpdir(), `chatgpt_manual_diagnostic_${Date.now()}`);
+  fs.mkdirSync(userDir, { recursive: true });
+  const cdpPort = 9600 + Math.floor(Math.random() * 250);
+  const chrome = spawn(chromePath, [
+    `--remote-debugging-port=${cdpPort}`,
+    `--user-data-dir=${userDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--start-maximized",
+    "about:blank"
+  ], { stdio: "ignore" });
+  let ws = null;
+  let stopping = false;
+  const intervals = [];
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    for (const timer of intervals) clearInterval(timer);
+    try {
+      ws?.close();
+    } catch {
+    }
+    try {
+      chrome.kill();
+    } catch {
+    }
+    setTimeout(() => {
+      try {
+        fs.rmSync(userDir, { recursive: true, force: true });
+      } catch {
+      }
+    }, 800);
+    console.log(`
+  \u2705 Diagnostic recording saved: ${diagnosticPath}`);
+  };
+  process.on("SIGINT", () => {
+    stop();
+    process.exit(0);
+  });
+  ws = await connectCDP(cdpPort);
+  if (!ws) throw new Error("Could not attach to Chrome");
+  const cdp = cdpClient(ws);
+  await cdp.send("Network.enable", {
+    maxTotalBufferSize: 100 * 1024 * 1024,
+    maxResourceBufferSize: 10 * 1024 * 1024,
+    maxPostDataSize: 1024 * 1024
+  });
+  await cdp.send("Page.enable");
+  await cdp.send("Runtime.enable");
+  try {
+    await cdp.send("Log.enable");
+  } catch {
+  }
+  try {
+    await cdp.send("Security.enable");
+  } catch {
+  }
+  emit("diagnostic_started", { cdpPort, passive: true }, "\u2705 passive recorder attached \u2014 perform the manual steps now");
+  const requests = /* @__PURE__ */ new Map();
+  const importantResponses = /* @__PURE__ */ new Map();
+  let lastCookieState = "";
+  let lastPageState = "";
+  cdp.on("Network.requestWillBeSent", (params) => {
+    const req = params.request || {};
+    const entry = {
+      requestId: params.requestId,
+      url: safeUrl2(req.url),
+      method: req.method,
+      type: params.type || "Other",
+      documentURL: params.documentURL ? safeUrl2(params.documentURL) : null,
+      initiator: params.initiator?.type || null,
+      startedAt: Date.now(),
+      headers: safeHeaders(req.headers),
+      postBytes: req.postData ? Buffer.byteLength(req.postData) : 0,
+      redirectFrom: params.redirectResponse?.url ? safeUrl2(params.redirectResponse.url) : null,
+      redirectStatus: params.redirectResponse?.status || null
+    };
+    requests.set(params.requestId, entry);
+    emit("request", entry, `\u2192 ${entry.method} ${entry.type} ${shortenUrl(entry.url)}`);
+  });
+  cdp.on("Network.requestWillBeSentExtraInfo", (params) => {
+    const blockedCookies = (params.associatedCookies || []).filter((item) => (item.blockedReasons || []).length).map((item) => ({ name: item.cookie?.name, reasons: item.blockedReasons }));
+    emit("request_extra", {
+      requestId: params.requestId,
+      headers: safeHeaders(params.headers),
+      blockedCookies,
+      connectTiming: params.connectTiming || null,
+      clientSecurityState: params.clientSecurityState || null
+    }, blockedCookies.length ? `\u{1F6AB} blocked request cookies: ${blockedCookies.map((x) => x.name).join(", ")}` : null);
+  });
+  cdp.on("Network.responseReceived", (params) => {
+    const response = params.response || {};
+    const request = requests.get(params.requestId);
+    const durationMs = request ? Date.now() - request.startedAt : null;
+    const timing = response.timing || null;
+    const record = {
+      requestId: params.requestId,
+      url: response.url,
+      type: params.type || request?.type || "Other",
+      status: response.status,
+      statusText: response.statusText,
+      mimeType: response.mimeType,
+      remoteIP: response.remoteIPAddress || null,
+      remotePort: response.remotePort || null,
+      protocol: response.protocol || null,
+      alternateProtocolUsage: response.alternateProtocolUsage || null,
+      connectionId: response.connectionId ?? null,
+      connectionReused: response.connectionReused ?? null,
+      fromDiskCache: !!response.fromDiskCache,
+      fromServiceWorker: !!response.fromServiceWorker,
+      fromPrefetchCache: !!response.fromPrefetchCache,
+      durationMs,
+      timing,
+      phaseMs: timing ? {
+        proxy: timing.proxyStart >= 0 && timing.proxyEnd >= 0 ? timing.proxyEnd - timing.proxyStart : null,
+        dns: timing.dnsStart >= 0 && timing.dnsEnd >= 0 ? timing.dnsEnd - timing.dnsStart : null,
+        connect: timing.connectStart >= 0 && timing.connectEnd >= 0 ? timing.connectEnd - timing.connectStart : null,
+        ssl: timing.sslStart >= 0 && timing.sslEnd >= 0 ? timing.sslEnd - timing.sslStart : null,
+        ttfb: timing.receiveHeadersStart >= 0 ? timing.receiveHeadersStart : null
+      } : null,
+      headers: safeHeaders(response.headers),
+      securityDetails: response.securityDetails ? {
+        protocol: response.securityDetails.protocol,
+        keyExchange: response.securityDetails.keyExchange,
+        cipher: response.securityDetails.cipher,
+        certificateId: response.securityDetails.certificateId,
+        issuer: response.securityDetails.issuer,
+        validFrom: response.securityDetails.validFrom,
+        validTo: response.securityDetails.validTo
+      } : null
+    };
+    emit(
+      "response",
+      record,
+      `\u2190 ${response.status} ${record.type} ${shortenUrl(response.url)} ip=${record.remoteIP || "?"} ${durationMs ?? "?"}ms`
+    );
+    if (/chatgpt\.com\/(api\/auth\/session|backend-(?:api|anon)\/me|backend-api\/checkout_pricing_config)/i.test(response.url || "")) {
+      importantResponses.set(params.requestId, { url: response.url, status: response.status });
+    }
+  });
+  cdp.on("Network.responseReceivedExtraInfo", (params) => {
+    const rawSetCookie = params.headers?.["set-cookie"] || params.headers?.["Set-Cookie"] || "";
+    const cookies = setCookieSummary(rawSetCookie);
+    const blockedCookies = (params.blockedCookies || []).map((item) => ({
+      name: item.cookie?.name || item.cookieLine?.split("=")[0],
+      reasons: item.blockedReasons
+    }));
+    emit("response_extra", {
+      requestId: params.requestId,
+      statusCode: params.statusCode,
+      headers: safeHeaders(params.headers),
+      setCookies: cookies,
+      blockedCookies,
+      resourceIPAddressSpace: params.resourceIPAddressSpace || null
+    }, cookies.length ? `\u{1F36A} Set-Cookie: ${cookies.map((c) => `${c.name}[${c.fingerprint}${c.clears ? ":clear" : ""}]`).join(", ")}` : blockedCookies.length ? `\u{1F6AB} blocked response cookies: ${blockedCookies.map((x) => x.name).join(", ")}` : null);
+  });
+  cdp.on("Network.loadingFinished", async (params) => {
+    const important = importantResponses.get(params.requestId);
+    requests.delete(params.requestId);
+    if (!important) return;
+    importantResponses.delete(params.requestId);
+    try {
+      const bodyResult = await cdp.send("Network.getResponseBody", { requestId: params.requestId });
+      let body = bodyResult.base64Encoded ? Buffer.from(bodyResult.body, "base64").toString("utf8") : bodyResult.body;
+      let parsed = null;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+      }
+      let verdict;
+      if (/api\/auth\/session/i.test(important.url)) {
+        verdict = parsed ? {
+          loggedIn: !!parsed.user,
+          emailFingerprint: fingerprint(parsed.user?.email || ""),
+          hasAccessToken: !!parsed.accessToken,
+          accountFingerprint: fingerprint(
+            typeof parsed.account === "string" ? parsed.account : parsed.account?.id || parsed.account?.account_id || ""
+          ),
+          expires: parsed.expires || null
+        } : { json: false, snippet: String(body).slice(0, 120) };
+      } else if (/backend-(?:api|anon)\/me/i.test(important.url)) {
+        verdict = parsed ? {
+          country: parsed.country || null,
+          emailFingerprint: fingerprint(parsed.email || parsed.user?.email || ""),
+          authenticated: important.url.includes("/backend-api/"),
+          keys: Object.keys(parsed).sort()
+        } : { json: false, snippet: String(body).slice(0, 120) };
+      } else {
+        verdict = parsed ? {
+          countryFromUrl: (important.url.match(/configs\/([A-Z]{2})/i) || [])[1] || null,
+          keys: Object.keys(parsed).sort()
+        } : { json: false, snippet: String(body).slice(0, 120) };
+      }
+      emit("important_response_body", {
+        requestId: params.requestId,
+        url: important.url,
+        status: important.status,
+        verdict
+      }, `\u{1F50E} ${shortenUrl(important.url)} => ${JSON.stringify(verdict)}`);
+    } catch (e) {
+      emit("response_body_unavailable", { requestId: params.requestId, url: important.url, error: e.message });
+    }
+  });
+  cdp.on("Network.loadingFailed", (params) => {
+    const request = requests.get(params.requestId);
+    requests.delete(params.requestId);
+    importantResponses.delete(params.requestId);
+    emit("loading_failed", {
+      requestId: params.requestId,
+      url: request?.url || null,
+      type: params.type || request?.type || null,
+      errorText: params.errorText,
+      canceled: !!params.canceled,
+      blockedReason: params.blockedReason || null,
+      corsErrorStatus: params.corsErrorStatus || null,
+      durationMs: request ? Date.now() - request.startedAt : null
+    }, `\u26A1 FAILED ${params.errorText} ${shortenUrl(request?.url || "")}`);
+  });
+  cdp.on("Page.frameNavigated", (params) => {
+    if (params.frame?.parentId) return;
+    emit("main_frame_navigated", {
+      url: params.frame?.url,
+      unreachableUrl: params.frame?.unreachableUrl ? safeUrl2(params.frame.unreachableUrl) : null,
+      securityOrigin: params.frame?.securityOrigin || null,
+      mimeType: params.frame?.mimeType || null
+    }, `\u{1F9ED} ${params.frame?.unreachableUrl ? `ERROR ${params.frame.unreachableUrl}` : params.frame?.url}`);
+  });
+  cdp.on("Page.domContentEventFired", (params) => emit("dom_content_loaded", params, "\u{1F4C4} DOMContentLoaded"));
+  cdp.on("Page.loadEventFired", (params) => emit("page_load", params, "\u{1F4C4} load"));
+  cdp.on("Runtime.exceptionThrown", (params) => {
+    const details = params.exceptionDetails || {};
+    emit("page_exception", {
+      text: details.text,
+      description: details.exception?.description?.slice(0, 1e3) || null,
+      url: details.url ? safeUrl2(details.url) : null,
+      lineNumber: details.lineNumber,
+      columnNumber: details.columnNumber
+    }, `\u{1F4A5} ${String(details.exception?.description || details.text || "").split("\n")[0].slice(0, 180)}`);
+  });
+  cdp.on("Runtime.consoleAPICalled", (params) => {
+    if (!["error", "warning", "assert"].includes(params.type)) return;
+    const text = (params.args || []).map((arg) => arg.value ?? arg.description ?? arg.type).join(" ").slice(0, 1e3);
+    emit("page_console", { level: params.type, text }, `\u{1F5A5}\uFE0F console.${params.type}: ${text.slice(0, 180)}`);
+  });
+  cdp.on("Log.entryAdded", (params) => {
+    const entry = params.entry || {};
+    emit("browser_log", {
+      level: entry.level,
+      source: entry.source,
+      text: entry.text,
+      url: entry.url ? safeUrl2(entry.url) : null,
+      networkRequestId: entry.networkRequestId || null
+    }, ["error", "warning"].includes(entry.level) ? `\u{1F4D5} ${entry.source}/${entry.level}: ${String(entry.text).slice(0, 180)}` : null);
+  });
+  cdp.on("Security.securityStateChanged", (params) => {
+    emit("security_state", {
+      securityState: params.securityState,
+      schemeIsCryptographic: params.schemeIsCryptographic,
+      explanations: params.explanations,
+      insecureContentStatus: params.insecureContentStatus
+    }, `\u{1F510} security=${params.securityState}`);
+  });
+  intervals.push(setInterval(async () => {
+    if (!cdp.isAlive() || stopping) return;
+    try {
+      const result = await cdp.send("Network.getCookies", { urls: ["https://chatgpt.com/"] });
+      const relevant = (result.cookies || []).filter((c) => /^(?:__Secure-next-auth\.session-token(?:\.\d+)?|_account|__cf_bm|_cfuvid|cf_clearance|__oailb|__cflb|oai-)/.test(c.name)).map((c) => ({
+        name: c.name,
+        domain: c.domain,
+        path: c.path,
+        bytes: (c.value || "").length,
+        fingerprint: fingerprint(c.value || ""),
+        expires: c.expires,
+        httpOnly: c.httpOnly,
+        secure: c.secure,
+        sameSite: c.sameSite || null,
+        session: c.session,
+        priority: c.priority || null,
+        partitionKey: c.partitionKey || null
+      })).sort((a, b) => `${a.name}@${a.domain}`.localeCompare(`${b.name}@${b.domain}`));
+      const state = JSON.stringify(relevant);
+      if (state !== lastCookieState) {
+        lastCookieState = state;
+        emit(
+          "cookie_jar_changed",
+          { cookies: relevant },
+          `\u{1FAD9} cookie jar: ${relevant.map((c) => `${c.name}[${c.fingerprint}]`).join(", ") || "empty"}`
+        );
+      }
+    } catch (e) {
+      emit("cookie_snapshot_failed", { error: e.message });
+    }
+  }, 750));
+  intervals.push(setInterval(async () => {
+    if (!cdp.isAlive() || stopping) return;
+    try {
+      const result = await cdp.send("Runtime.evaluate", {
+        expression: `JSON.stringify({
+          href: location.href,
+          host: location.hostname,
+          readyState: document.readyState,
+          title: document.title,
+          visible: document.visibilityState,
+          online: navigator.onLine,
+          accountChooser: (document.body?.innerText || '').toLowerCase().includes('choose an account to continue'),
+          hasLoginButton: Array.from(document.querySelectorAll('button,a')).some(el => /^(log in|login)$/i.test((el.textContent || '').trim())),
+          hasUpgrade: Array.from(document.querySelectorAll('button,a,span')).some(el => /upgrade/i.test((el.textContent || '').trim()))
+        })`,
+        returnByValue: true,
+        timeout: 3e3
+      });
+      const page = JSON.parse(result.result?.value || "{}");
+      const state = JSON.stringify(page);
+      if (state !== lastPageState) {
+        lastPageState = state;
+        emit(
+          "page_state_changed",
+          page,
+          `\u{1F441}\uFE0F page=${shortenUrl(page.href || "")} ready=${page.readyState} chooser=${!!page.accountChooser} login=${!!page.hasLoginButton} upgrade=${!!page.hasUpgrade}`
+        );
+      }
+    } catch (e) {
+      emit("page_state_unavailable", { error: e.message });
+    }
+  }, 750));
+  emit("initial_navigation_requested", { url: "https://chatgpt.com/" }, "\u{1F310} opening ChatGPT under observation");
+  await cdp.send("Page.navigate", { url: "https://chatgpt.com/" });
+  while (cdp.isAlive() && !stopping) await sleep(1e3);
+  stop();
+}
+var selectedMain = process.argv.includes("--diagnose") ? diagnosticMain : main;
+selectedMain().catch((e) => {
+  console.error("\n\u274C Fatal:", e.stack || e.message);
   process.exit(1);
 });
