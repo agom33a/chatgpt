@@ -1,7 +1,23 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v8.5 - Fresh cookie, warm route)
+ *   🎯 ChatGPT Manual Browser Smart (v9.0 - Isolated API checkout)
+ *
+ *   v9.0 additions:
+ *     - Creates checkout from a disposable background API target, independent
+ *       of the visible tab's document, signed-in render, and recovery state
+ *     - Confirms exit country with multiple providers and asks the user to
+ *       approve the billing country before creating a checkout session
+ *     - Uses explicit access-token/account authentication, progress-aware
+ *       cancellation/timeouts, and stage traces without logging credentials
+ *     - Visible ChatGPT UI recovery is optional after checkout readiness
+ *
+ *   v8.6 additions:
+ *     - Races isolated, non-rendering ChatGPT edge/session/account probes
+ *       before treating generic proxy internet access as ChatGPT readiness
+ *     - Records HTTP status, Chromium network error, and latency per endpoint
+ *     - Reopens only idle connections once when ChatGPT fails independently;
+ *       does not clear cookies/cache or navigate a known-bad endpoint
  *
  *   v8.5 additions:
  *     - Never replaces a session cookie the browser already sent, because
@@ -153,6 +169,11 @@ const path = require('path');
 const os = require('os');
 const readline = require('readline');
 const crypto = require('crypto');
+const {
+  runChatGPTReadinessBenchmark,
+  selectReadinessRecovery
+} = require('./chatgpt_readiness');
+const { runIsolatedCheckout } = require('./isolated_checkout');
 
 // Full-visibility tracing. TRACE=0 silences the stream, TRACE_ASSETS=1 also
 // prints successful images/fonts/scripts (very noisy, off by default).
@@ -878,7 +899,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v8.5 - Fresh Cookie, Warm Route)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v9.0 - Isolated API Checkout)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -1674,6 +1695,31 @@ async function main() {
     return lastHealthy ? { ...lastHealthy, changed: false } : null;
   }
 
+  async function benchmarkChatGPTRoute(stage) {
+    const benchmark = await runChatGPTReadinessBenchmark(cdp, { timeoutMs: 18000 });
+    trace('chatgpt_readiness_benchmark', {
+      stage,
+      state: benchmark.state,
+      ready: benchmark.ready,
+      elapsedMs: benchmark.elapsedMs,
+      fastest: benchmark.fastest?.name || null,
+      probes: benchmark.results.map(result => ({
+        name: result.name,
+        kind: result.kind,
+        ok: result.ok,
+        status: result.status,
+        elapsedMs: result.elapsedMs,
+        netError: result.netError,
+        error: result.error
+      }))
+    }, `🧪 ChatGPT readiness (${stage}): ${benchmark.state} in ${benchmark.elapsedMs}ms — ${
+      benchmark.results.map(result =>
+        `${result.name}=${result.ok ? `HTTP ${result.status}` : result.error || 'failed'}@${result.elapsedMs}ms`
+      ).join(', ')
+    }`);
+    return benchmark;
+  }
+
   // Waits for the document while the connection is still making progress.
   // minWaitMs is a floor, not a deadline: as long as ChatGPT keeps producing
   // network events the wait continues, so a slow proxy is not mistaken for a
@@ -2127,9 +2173,6 @@ async function main() {
     trace('recovery_started', { reasons, knownCountry: lastKnownCountry },
       `🔌 recovery started: ${reasons.join(', ')}`);
 
-    // Force the health check to open a fresh route through the extension.
-    try { await cdp.send('Network.closeIdleConnections'); } catch {}
-
     // A dropped tunnel means the extension is mid-switch, so allow more time
     // for the new exit country; an auth-only failure needs far less.
     const routeChangeExpected = reasons.some(reason => /ERR_|tunnel|connection|network/i.test(reason));
@@ -2153,6 +2196,35 @@ async function main() {
     }, `✅ route ready: ${route.country} via ${route.provider} (${route.elapsedMs}ms${route.changed ? ', country changed' : ', country unchanged'})`);
 
     activeRouteCountry = route.country;
+
+    // An IP service proves only generic internet access. Test ChatGPT itself
+    // without navigating or rendering before touching cache, cookies, or the
+    // visible page. A stale pooled tunnel gets exactly one inexpensive reset.
+    setRecoveryState('probing-chatgpt');
+    let readiness = await benchmarkChatGPTRoute('existing connection pool');
+    let readinessAction = selectReadinessRecovery(readiness, true, false);
+    if (readinessAction === 'reopen-connection-pool') {
+      trace('chatgpt_readiness_recovery', {
+        action: readinessAction,
+        state: readiness.state
+      }, '🔌 generic internet works but ChatGPT does not; reopening idle connections once');
+      try { await cdp.send('Network.closeIdleConnections'); } catch {}
+      readiness = await benchmarkChatGPTRoute('fresh connection pool');
+      readinessAction = selectReadinessRecovery(readiness, true, true);
+    }
+    if (readinessAction === 'reject-chatgpt-endpoint') {
+      console.log('  ⚠️ This proxy has internet access but its ChatGPT endpoints did not answer.');
+      console.log('     No cookies/cache were cleared and the visible page was not reloaded.');
+      console.log('     Select another proxy endpoint, then retry.');
+      console.log(`     Diagnostics: ${diagnosticsPath}\n`);
+      trace('recovery_failed', {
+        stage: 'chatgpt_endpoint_unreachable',
+        routeCountry: route.country,
+        readiness: readiness.state,
+        probes: readiness.results
+      });
+      return null;
+    }
 
     // Persisting the cookie is essential: header injection authenticates a
     // request but does not populate Chrome's cookie jar after an IP change.
@@ -2399,13 +2471,10 @@ async function main() {
     if (route.ok && lastExitCountry && route.country !== lastExitCountry) {
       markActivity();
       trace('exit_country_changed', { from: lastExitCountry, to: route.country },
-        `🌐 exit IP moved ${lastExitCountry} → ${route.country}; preparing the route`);
+        `🌐 exit IP moved ${lastExitCountry} → ${route.country}; checking ChatGPT endpoints`);
       anonymousRepairAttempts = 0;
       anonymousNoticeShown = false;
-      void (async () => {
-        await reestablishSessionForNewIp('exit ip change');
-        await warmUpChatGPTInBackground(route.country, 15000);
-      })();
+      void requestProxyRecovery(`exit country changed ${lastExitCountry} → ${route.country}`);
     }
     if (route.ok) lastExitCountry = route.country;
     trace('snapshot', {
