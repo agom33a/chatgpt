@@ -1,0 +1,10 @@
+node_modules/
+
+# Runtime-provided credentials / config (never commit)
+session_api.json
+proxies.json
+
+# Runtime-generated output
+pay_links.txt
+*.log
+extensions/

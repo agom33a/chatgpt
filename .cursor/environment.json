@@ -1,0 +1,4 @@
+{
+  "name": "chatgpt-manual-browser-smart",
+  "install": "npm ci"
+}

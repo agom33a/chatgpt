@@ -1,0 +1,19 @@
+{
+  "name": "chatgpt-manual-browser-smart",
+  "version": "8.3.0",
+  "private": true,
+  "description": "Node.js CLI that drives Chrome over the DevTools Protocol for the ChatGPT manual browser workflow.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "manual-browser-smart": "manual_browser_smart (17).js"
+  },
+  "scripts": {
+    "start": "node \"manual_browser_smart (17).js\""
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
