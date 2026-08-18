@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v7.6 - Safe checkout context)
+ *   🎯 ChatGPT Manual Browser Smart (v7.7 - Quieter and safer)
+ *
+ *   v7.7 additions:
+ *     - Stops recreating the duplicate session cookie it had just removed
+ *     - Saves every generated pay link to pay_links.txt before opening the tab
+ *     - Keeps analytics/telemetry traffic out of the terminal trace
+ *     - Halves polling while the connection is idle
  *
  *   v7.6 additions:
  *     - Fixes the chatgpt.comblank URL built from an about:blank pathname
@@ -107,6 +113,11 @@ const crypto = require('crypto');
 // prints successful images/fonts/scripts (very noisy, off by default).
 const TRACE_ENABLED = process.env.TRACE !== '0';
 const TRACE_ASSETS = process.env.TRACE_ASSETS === '1';
+// ChatGPT's own analytics endpoints produce hundreds of identical lines that
+// bury the session and region events; they stay in the diagnostics file.
+const TRACE_TELEMETRY = process.env.TRACE_TELEMETRY === '1';
+const TELEMETRY_PATTERN = /chatgpt\.com\/(ces\/|backend-api\/(?:lat|edge)\/)|\/telemetry\/intake|cdn-cgi\/challenge-platform/i;
+const isTelemetryUrl = url => !TRACE_TELEMETRY && TELEMETRY_PATTERN.test(String(url || ''));
 const ASSET_TYPES = new Set(['Image', 'Font', 'Stylesheet', 'Media', 'Manifest', 'Script', 'Prefetch']);
 const SECRET_HEADERS = new Set(['cookie', 'set-cookie', 'authorization', 'proxy-authorization']);
 const startedAt = Date.now();
@@ -646,6 +657,24 @@ async function openInNewTab(cdp, url) {
   await cdp.send('Target.createTarget', { url });
 }
 
+const PAY_LINK_FILE = './pay_links.txt';
+
+function savePayLink(result, apiSession) {
+  const line = [
+    new Date().toISOString(),
+    apiSession.user?.email || 'unknown',
+    result.country,
+    result.currency,
+    result.url
+  ].join(' | ');
+  try {
+    fs.appendFileSync(PAY_LINK_FILE, line + '\n');
+    return path.resolve(PAY_LINK_FILE);
+  } catch {
+    return null;
+  }
+}
+
 const MAX_COOKIE_BYTES = 4096;
 
 async function installSessionCookie(cdp, sessionToken) {
@@ -748,7 +777,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v7.6 - Safe Checkout Context)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v7.7 - Quieter And Safer)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -768,7 +797,7 @@ async function main() {
     if (TRACE_ENABLED && line) writeLine(`  ${elapsedStamp()} ${line}`);
   };
 
-  console.log(`  🧾 Trace stream: ${TRACE_ENABLED ? 'ON' : 'OFF'} (TRACE=0 to silence, TRACE_ASSETS=1 for asset traffic)`);
+  console.log(`  🧾 Trace stream: ${TRACE_ENABLED ? 'ON' : 'OFF'} (TRACE=0 silence | TRACE_ASSETS=1 assets | TRACE_TELEMETRY=1 analytics)`);
   console.log(`  🗂️  Diagnostics file: ${diagnosticsPath}\n`);
 
   if (!fs.existsSync('./session_api.json')) {
@@ -998,8 +1027,9 @@ async function main() {
         removed: distinct.size - 1,
         domains: cookies.map(c => c.domain)
       }, `🔑 removed ${distinct.size - 1} duplicate session cookie(s)`);
+      // Re-installing here would immediately recreate the duplicate that was
+      // just removed, which produced a dedup message every few seconds.
       adoptSessionToken(keep, `${source} (deduplicated)`);
-      await installSessionCookie(cdp, sessionToken);
       return true;
     }
 
@@ -1022,14 +1052,14 @@ async function main() {
       method: params.request?.method || 'GET',
       startedAt: Date.now()
     });
-    if (isAsset(type) && !TRACE_ASSETS) return;
+    const quiet = (isAsset(type) && !TRACE_ASSETS) || isTelemetryUrl(url);
     trace('request', {
       requestId: params.requestId,
       method: params.request?.method,
       type,
       url,
       headers: redactHeaders(params.request?.headers)
-    }, `→ ${params.request?.method || 'GET'} ${type} ${shortenUrl(url)}`);
+    }, quiet ? null : `→ ${params.request?.method || 'GET'} ${type} ${shortenUrl(url)}`);
   });
 
   cdp.on('Network.requestWillBeSentExtraInfo', params => {
@@ -1052,7 +1082,8 @@ async function main() {
     const type = params.type || info?.type || 'Other';
     const response = params.response || {};
     const durationMs = info ? Date.now() - info.startedAt : null;
-    if (isAsset(type) && !TRACE_ASSETS && response.status < 400) return;
+    const quiet = response.status < 400 &&
+      ((isAsset(type) && !TRACE_ASSETS) || isTelemetryUrl(response.url));
     trace('response', {
       requestId: params.requestId,
       status: response.status,
@@ -1064,7 +1095,7 @@ async function main() {
       fromServiceWorker: !!response.fromServiceWorker,
       durationMs,
       headers: redactHeaders(response.headers)
-    }, `← ${response.status} ${type} ${shortenUrl(response.url)} ip=${response.remoteIPAddress || '?'}${durationMs === null ? '' : ` ${durationMs}ms`}`);
+    }, quiet ? null : `← ${response.status} ${type} ${shortenUrl(response.url)} ip=${response.remoteIPAddress || '?'}${durationMs === null ? '' : ` ${durationMs}ms`}`);
   });
 
   cdp.on('Network.loadingFinished', params => {
@@ -1197,7 +1228,8 @@ async function main() {
     const resourceType = params.resourceType || 'Other';
     requestCounter++;
 
-    if (!isAsset(resourceType) || TRACE_ASSETS) {
+    const quietIntercept = (isAsset(resourceType) && !TRACE_ASSETS) || isTelemetryUrl(url);
+    {
       trace('fetch_intercepted', {
         requestId,
         method: params.request?.method,
@@ -1205,7 +1237,7 @@ async function main() {
         url,
         inject: shouldInject,
         cookieFingerprint: shouldInject ? fingerprint(sessionToken) : null
-      }, `⇢ intercept ${params.request?.method || 'GET'} ${resourceType} ${short}${shouldInject ? ` inject=${fingerprint(sessionToken)}` : ' inject=no'}`);
+      }, quietIntercept ? null : `⇢ intercept ${params.request?.method || 'GET'} ${resourceType} ${short}${shouldInject ? ` inject=${fingerprint(sessionToken)}` : ' inject=no'}`);
     }
 
     // Timeout timer
@@ -1344,6 +1376,14 @@ async function main() {
   let last401At = 0;
   let lastTransportFailureAt = 0;
   let challengeSeenAt = 0;
+
+  // Polling stays fast for a minute after anything interesting happens, then
+  // halves its rate so an idle session does not hammer the API every 4s.
+  let lastInterestingAt = Date.now();
+  let countryTick = 0;
+  let snapshotTick = 0;
+  const markActivity = () => { lastInterestingAt = Date.now(); };
+  const inActivePeriod = () => Date.now() - lastInterestingAt < 60000;
   let recoveryPromise = null;
   let recoveryState = 'idle';
   let recoveryStateSince = Date.now();
@@ -1528,6 +1568,20 @@ async function main() {
     }
   }
 
+  // Writes our copy of the session cookie only when the jar has none, so the
+  // browser's own cookie stays the single source of truth.
+  async function ensureSessionCookiePresent(stage) {
+    const cookies = await readSessionCookies(cdp);
+    if (cookies.length) return false;
+    const stored = await installSessionCookie(cdp, sessionToken);
+    trace('session_cookie_restored', {
+      stage,
+      stored,
+      fingerprint: fingerprint(sessionToken)
+    }, `🍪 session cookie ${stored ? 'restored in the jar' : 'left to header injection'} (${stage})`);
+    return stored;
+  }
+
   async function releaseOldRegionState(stage) {
     try { await cdp.send('Network.clearBrowserCache'); } catch {}
     try { await cdp.send('Network.closeIdleConnections'); } catch {}
@@ -1535,13 +1589,13 @@ async function main() {
     const cleared = await clearRegionPinnedCookies(cdp, includeChallenge);
     trace('region_pinned_cookies_cleared', { stage, count: cleared.length, includeChallenge },
       `🧹 cleared ${cleared.length} IP-pinned cookie entries (${stage}${includeChallenge ? ', incl. challenge clearance' : ''})`);
-    await installSessionCookie(cdp, sessionToken);
+    await ensureSessionCookiePresent(stage);
   }
 
   async function warmUpChatGPTInBackground(routeCountry) {
     let targetId = null;
     try {
-      await installSessionCookie(cdp, sessionToken);
+      await ensureSessionCookiePresent('background warmup');
       const target = await cdp.send('Target.createTarget', {
         url: 'about:blank',
         background: true
@@ -1702,12 +1756,7 @@ async function main() {
 
     // Persisting the cookie is essential: header injection authenticates a
     // request but does not populate Chrome's cookie jar after an IP change.
-    const stored = await installSessionCookie(cdp, sessionToken);
-    trace('session_cookie_reinstall', {
-      stored,
-      cookieSize: sessionToken.length + COOKIE_NAME.length + 1,
-      fingerprint: fingerprint(sessionToken)
-    }, `🍪 session cookie ${stored ? 'stored' : 'kept as header injection (too large for the jar)'} (fp=${fingerprint(sessionToken)})`);
+    await ensureSessionCookiePresent('recovery');
 
     // With the tab on an error/blank page every in-page probe fails, so the
     // pre-checks are skipped and the single navigation happens right away.
@@ -1744,7 +1793,7 @@ async function main() {
     trace('background_warmup_started', { routeCountry: route.country },
       '🔥 priming ChatGPT session in a background tab');
     await warmUpChatGPTInBackground(route.country);
-    await installSessionCookie(cdp, sessionToken);
+    await ensureSessionCookiePresent('after warmup');
 
     const afterWarmup = await verifyStableSession();
     trace('warmup_verification', {
@@ -1788,6 +1837,7 @@ async function main() {
 
   function requestProxyRecovery(reason) {
     if (cleaning || !cdp.isAlive()) return Promise.resolve(null);
+    markActivity();
     pendingRecoveryReasons.add(reason);
     if (recoveryPromise) return recoveryPromise;
 
@@ -1862,6 +1912,7 @@ async function main() {
   // Background country monitor (backup layer + country change detection)
   const countryMonitor = setInterval(async () => {
     if (!cdp.isAlive() || cleaning || autoReloadInProgress) return;
+    if (!inActivePeriod() && ++countryTick % 2) return;
     try {
       const res = await cdp.send('Runtime.evaluate', {
         expression: `fetch('/backend-api/me',{credentials:'include',cache:'no-store'}).then(async r=>{if(r.ok){const d=await r.json().catch(()=>({}));return JSON.stringify({status:200,country:d.country||null,email:d.email||null});}return JSON.stringify({status:r.status});}).catch(e=>JSON.stringify({status:0,error:e.message}))`,
@@ -1877,6 +1928,7 @@ async function main() {
       });
 
       if (data.status === 401 || data.status === 403) {
+        markActivity();
         void requestProxyRecovery(`${data.status} from country check`);
         return;
       }
@@ -1887,6 +1939,7 @@ async function main() {
           trace('country_established', { country: data.country },
             `🌍 ChatGPT country: ${data.country} (${currencyForCountry(data.country)})`);
         } else if (lastKnownCountry !== data.country) {
+          markActivity();
           trace('country_changed_without_recovery', {
             from: lastKnownCountry,
             to: data.country
@@ -1905,6 +1958,7 @@ async function main() {
   // compared at a glance while a switch is happening.
   const snapshotMonitor = setInterval(async () => {
     if (!cdp.isAlive() || cleaning || autoReloadInProgress) return;
+    if (!inActivePeriod() && ++snapshotTick % 2) return;
     const route = await probeExitCountry(cdp);
     const location = await currentPageLocation();
     trace('snapshot', {
@@ -1924,7 +1978,7 @@ async function main() {
   console.log('  🕵️  MONITORING MODE ACTIVE');
   console.log('  📍 Watching for trial offers OR pricing pages');
   console.log('  ⚡ Proxy recovery state machine: idle');
-  console.log('  🌍 Country monitor 4s | exit-IP snapshot 10s');
+  console.log('  🌍 Country monitor 4s | exit-IP snapshot 10s (halved while idle)');
   console.log(`  🧾 Trace: ${TRACE_ENABLED ? 'every request, response, cookie, and page event' : 'off'}`);
   console.log('  💡 Press Ctrl+C to quit at any time');
   console.log('  ' + '─'.repeat(56) + '\n');
@@ -2032,6 +2086,12 @@ async function main() {
       console.log(`     Currency: ${result.currency}`);
       console.log(`     Sentinel: ${result.sentinelUsed ? 'YES' : 'NO'}`);
       console.log(`     URL:      ${result.url}`);
+
+      // Saved before opening the tab: a checkout session stays valid even if
+      // the tab fails to load, so the link must never be lost.
+      const savedTo = savePayLink(result, apiSession);
+      if (savedTo) console.log(`     Saved:    ${savedTo}`);
+
       console.log('  🌐 Opening in new tab...');
       await openInNewTab(cdp, result.url);
       console.log('  ✅ Done! Complete payment in the new tab.\n');
