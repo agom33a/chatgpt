@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v8.3 - No reload loops)
+ *   🎯 ChatGPT Manual Browser Smart (v8.4 - Session re-establishment)
+ *
+ *   v8.4 additions:
+ *     - Refreshes the session for the new IP the way ChatGPT's client does
+ *     - Restores the active-account cookie the server clears on a region change
+ *     - Runs that refresh proactively as soon as the region changes
  *
  *   v8.3 additions:
  *     - One reload per signed-out episode, never a loop
@@ -864,7 +869,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v8.3 - No Reload Loops)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v8.4 - Session Re-establishment)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -1790,6 +1795,75 @@ async function main() {
   // After an IP change ChatGPT sometimes renders the page as a signed-out
   // visitor even though the session is still valid, which is why a second manual
   // refresh used to fix it. One reload with the valid cookie restores it.
+  // ChatGPT's own client repairs a region mismatch by refreshing the session
+  // with reason=integrity_state_mismatch (seen in its startup traffic). On the
+  // signed-out page the client never does it, so the script performs it and
+  // restores the active-account cookie the server cleared.
+  async function reestablishSessionForNewIp(stage) {
+    let refresh = { status: 0 };
+    try {
+      const res = await cdp.send('Runtime.evaluate', {
+        expression: `(async () => {
+          try {
+            const response = await fetch('/api/auth/session?refresh=true&reason=integrity_state_mismatch', {
+              credentials: 'include',
+              cache: 'no-store'
+            });
+            const text = await response.text();
+            let data = null;
+            try { data = JSON.parse(text); } catch {}
+            const account = typeof data?.account === 'string'
+              ? data.account
+              : (data?.account?.id || data?.account?.account_id || null);
+            return JSON.stringify({
+              status: response.status,
+              loggedIn: !!data?.user,
+              email: data?.user?.email || null,
+              account,
+              hasToken: !!data?.accessToken
+            });
+          } catch (e) {
+            return JSON.stringify({ status: 0, error: e.message });
+          }
+        })()`,
+        awaitPromise: true, returnByValue: true, timeout: 40000
+      }, null, 50000);
+      refresh = JSON.parse(res.result?.value || '{}');
+    } catch (e) {
+      refresh = { status: 0, error: e.message };
+    }
+
+    // Restore the active-account cookie so the server stops asking which
+    // account to use.
+    let accountCookieSet = false;
+    if (refresh.account) {
+      try {
+        const result = await cdp.send('Network.setCookie', {
+          name: '_account',
+          value: refresh.account,
+          url: 'https://chatgpt.com/',
+          path: '/',
+          secure: true,
+          sameSite: 'Lax'
+        });
+        accountCookieSet = result?.success !== false;
+      } catch {}
+    }
+
+    await syncActiveSessionCookie('integrity refresh');
+    trace('session_reestablished_for_ip', {
+      stage,
+      status: refresh.status || 0,
+      loggedIn: !!refresh.loggedIn,
+      hasToken: !!refresh.hasToken,
+      accountKnown: !!refresh.account,
+      accountCookieSet,
+      error: refresh.error || null
+    }, `🔁 session refreshed for the new IP (${stage}): HTTP ${refresh.status || 0}${refresh.loggedIn ? ', signed in' : ''}${accountCookieSet ? ', active account restored' : ''}`);
+
+    return refresh;
+  }
+
   async function detectAccountChooser() {
     try {
       const res = await cdp.send('Runtime.evaluate', {
@@ -1839,12 +1913,14 @@ async function main() {
       }
 
       console.log('\n  👤 ChatGPT rendered the page as a signed-out visitor, but the session is still valid.');
-      console.log('  🔄 Reloading once to restore the signed-in view...');
+      console.log('  🔁 Re-establishing the session for the new IP, then reloading once...');
       trace('anonymous_render_repair_started', { country: session.country || null });
 
       cancelActiveQuestion();
       handled = false;
       lastOfferSeen = false;
+
+      await reestablishSessionForNewIp('signed-out page');
 
       const marker = `session_repair=${Date.now()}`;
       try { await cdp.send('Page.stopLoading'); } catch {}
@@ -2117,6 +2193,9 @@ async function main() {
     activeRouteCountry = route.country;
     anonymousRepairAttempts = 0;
     anonymousNoticeShown = false;
+    if (oldCountry && oldCountry !== state.country) {
+      void reestablishSessionForNewIp('after recovery');
+    }
     const matchesRoute = state.country === route.country;
 
     console.log(`  ✅ Session active${state.email ? `: ${state.email}` : ''}`);
@@ -2261,6 +2340,10 @@ async function main() {
           lastOfferSeen = false;
           anonymousRepairAttempts = 0;
           anonymousNoticeShown = false;
+          // Refresh the session for the new region right away; ChatGPT clears
+          // the active-account state on an IP change, and doing this before the
+          // page notices often prevents the signed-out render entirely.
+          void reestablishSessionForNewIp('country change');
         }
       }
     } catch (e) {
