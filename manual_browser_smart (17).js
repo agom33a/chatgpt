@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v7.2 - Background session warm-up)
+ *   🎯 ChatGPT Manual Browser Smart (v7.3 - Region-accurate checkout)
+ *
+ *   v7.3 additions:
+ *     - Bills the country of the real exit IP, not ChatGPT's cached region
+ *     - Clears Cloudflare/device cookies pinned to the previous IP
+ *     - Reloads the same view so plan cards recompute for the new region
+ *     - Reports region drift instead of failing recovery
  *
  *   v7.2 additions:
  *     - Cancels stale trial prompts during a network transition
@@ -283,41 +289,79 @@ const TIMEZONE_TO_COUNTRY = {
   'Australia/Sydney': 'AU', 'Australia/Melbourne': 'AU', 'Pacific/Auckland': 'NZ'
 };
 
-// ── Auto-detect country (ChatGPT's own view > IP APIs > timezone) ──
+// ── Exit-IP country probe (the country the extension actually routes through) ──
+async function probeExitCountry(cdp, sessionId = null) {
+  const startedAt = Date.now();
+  try {
+    const res = await cdp.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const providers = [
+          {url:'https://api.country.is/', field:'country', name:'api.country.is'},
+          {url:'https://ipwho.is/', field:'country_code', name:'ipwho.is'},
+          {url:'https://ipapi.co/json/', field:'country_code', name:'ipapi.co'},
+          {url:'https://ipinfo.io/json', field:'country', name:'ipinfo.io'}
+        ];
+        for (const provider of providers) {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 2500);
+          try {
+            const joiner = provider.url.includes('?') ? '&' : '?';
+            const response = await fetch(provider.url + joiner + '_=' + Date.now(), {
+              cache: 'no-store',
+              signal: controller.signal
+            });
+            const data = await response.json();
+            const country = String(data[provider.field] || '').toUpperCase();
+            if (response.ok && /^[A-Z]{2}$/.test(country)) {
+              return JSON.stringify({ok:true,country,provider:provider.name});
+            }
+          } catch {}
+          finally { clearTimeout(timer); }
+        }
+        return JSON.stringify({ok:false});
+      })()`,
+      awaitPromise: true, returnByValue: true, timeout: 14000
+    }, sessionId);
+    const route = JSON.parse(res.result?.value || '{}');
+    route.elapsedMs = Date.now() - startedAt;
+    return route;
+  } catch (e) {
+    return { ok: false, error: e.message, elapsedMs: Date.now() - startedAt };
+  }
+}
+
+// ── Auto-detect country (real exit IP > ChatGPT's cached view > timezone) ──
 async function detectCountry(cdp) {
   // ⭐ Bypass ChatGPT's strict CSP so we can fetch external APIs
   try { await cdp.send('Page.setBypassCSP', { enabled: true }); } catch {}
 
-  // ═══ PRIORITY 1: ChatGPT's own /backend-api/me endpoint ═══
-  // This is what ChatGPT ACTUALLY sees for the account - matches the
-  // pricing shown on screen exactly. Works with any VPN/proxy/extension.
+  // ═══ PRIORITY 1: exit IP of the active proxy/extension route ═══
+  // /backend-api/me reports the region the session was established in, so it
+  // lags behind an extension country switch and must not win here.
+  const route = await probeExitCountry(cdp);
+  const routeCountry = route.ok ? route.country : null;
+
+  // ═══ PRIORITY 2: ChatGPT's own view, kept to report region drift ═══
+  let accountCountry = null;
   try {
     const res = await cdp.send('Runtime.evaluate', {
-      expression: `fetch('/backend-api/me',{credentials:'include'}).then(r=>r.json()).then(d=>d.country||'').catch(()=>'')`,
+      expression: `fetch('/backend-api/me',{credentials:'include',cache:'no-store'}).then(r=>r.json()).then(d=>d.country||'').catch(()=>'')`,
       awaitPromise: true, returnByValue: true, timeout: 8000
     });
-    const country = (res.result?.value || '').toUpperCase().trim();
-    if (country && /^[A-Z]{2}$/.test(country)) {
-      return { country, source: 'ChatGPT /me' };
-    }
+    const value = (res.result?.value || '').toUpperCase().trim();
+    if (/^[A-Z]{2}$/.test(value)) accountCountry = value;
   } catch {}
 
-  // ═══ PRIORITY 2: External IP APIs (with CSP bypass) ═══
-  const providers = [
-    { url: 'https://ipapi.co/json/', field: 'country_code' },
-    { url: 'https://ipwho.is/', field: 'country_code' },
-    { url: 'https://api.country.is/', field: 'country' },
-    { url: 'https://ipinfo.io/json', field: 'country' }
-  ];
-  for (const p of providers) {
-    try {
-      const res = await cdp.send('Runtime.evaluate', {
-        expression: `fetch(${JSON.stringify(p.url)}).then(r=>r.json()).then(d=>d.${p.field}||'').catch(()=>'')`,
-        awaitPromise: true, returnByValue: true, timeout: 8000
-      });
-      const country = (res.result?.value || '').toUpperCase().trim();
-      if (country && /^[A-Z]{2}$/.test(country)) return { country, source: `IP (${new URL(p.url).hostname})` };
-    } catch {}
+  if (routeCountry) {
+    return {
+      country: routeCountry,
+      source: `exit IP (${route.provider})`,
+      accountCountry,
+      drifted: !!accountCountry && accountCountry !== routeCountry
+    };
+  }
+  if (accountCountry) {
+    return { country: accountCountry, source: 'ChatGPT /me', accountCountry, drifted: false };
   }
 
   // ═══ PRIORITY 3: Browser timezone → country (last resort) ═══
@@ -328,7 +372,12 @@ async function detectCountry(cdp) {
     });
     const tz = tzRes.result?.value;
     if (tz && TIMEZONE_TO_COUNTRY[tz]) {
-      return { country: TIMEZONE_TO_COUNTRY[tz], source: `timezone (${tz})` };
+      return {
+        country: TIMEZONE_TO_COUNTRY[tz],
+        source: `timezone (${tz})`,
+        accountCountry,
+        drifted: !!accountCountry && accountCountry !== TIMEZONE_TO_COUNTRY[tz]
+      };
     }
   } catch {}
 
@@ -515,6 +564,26 @@ async function installSessionCookie(cdp, sessionToken) {
   }
 }
 
+// Cloudflare and OpenAI device cookies are issued for the previous exit IP and
+// keep pinning the old regional edge (and its currency) after a country switch.
+const REGION_PINNED_COOKIES = [
+  '__cf_bm', '_cfuvid', 'cf_clearance',
+  'oai-did', 'oai-hlib', 'oai-sc', 'oai-allow-ne', 'oai-nav-state'
+];
+
+async function clearRegionPinnedCookies(cdp) {
+  const cleared = [];
+  for (const name of REGION_PINNED_COOKIES) {
+    for (const domain of ['chatgpt.com', '.chatgpt.com']) {
+      try {
+        await cdp.send('Network.deleteCookies', { name, domain, path: '/' });
+        cleared.push(`${name}@${domain}`);
+      } catch {}
+    }
+  }
+  return cleared;
+}
+
 async function readSessionCookie(cdp) {
   try {
     const result = await cdp.send('Network.getCookies', {
@@ -529,7 +598,7 @@ async function readSessionCookie(cdp) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v7.2 - Background Session Warm-up)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v7.3 - Region-Accurate Checkout)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -914,6 +983,7 @@ async function main() {
 
   // Connection state shared by all network signals.
   let lastKnownCountry = initialCountry;
+  let activeRouteCountry = null;
   let autoReloadInProgress = false;
   let last401At = 0;
   let lastTransportFailureAt = 0;
@@ -942,51 +1012,13 @@ async function main() {
     }
   }
 
-  async function probeProxyRoute() {
-    const startedAt = Date.now();
-    try {
-      const res = await cdp.send('Runtime.evaluate', {
-        expression: `(async () => {
-          const providers = [
-            {url:'https://api.country.is/', field:'country', name:'api.country.is'},
-            {url:'https://ipwho.is/', field:'country_code', name:'ipwho.is'}
-          ];
-          for (const provider of providers) {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 2500);
-            try {
-              const joiner = provider.url.includes('?') ? '&' : '?';
-              const response = await fetch(provider.url + joiner + '_=' + Date.now(), {
-                cache: 'no-store',
-                signal: controller.signal
-              });
-              const data = await response.json();
-              const country = String(data[provider.field] || '').toUpperCase();
-              if (response.ok && /^[A-Z]{2}$/.test(country)) {
-                return JSON.stringify({ok:true,country,provider:provider.name});
-              }
-            } catch {}
-            finally { clearTimeout(timer); }
-          }
-          return JSON.stringify({ok:false});
-        })()`,
-        awaitPromise: true, returnByValue: true, timeout: 7000
-      });
-      const route = JSON.parse(res.result?.value || '{}');
-      route.elapsedMs = Date.now() - startedAt;
-      return route;
-    } catch (e) {
-      return { ok: false, error: e.message, elapsedMs: Date.now() - startedAt };
-    }
-  }
-
   async function waitForHealthyProxyRoute(previousCountry, timeoutMs = 45000) {
     const deadline = Date.now() + timeoutMs;
     let probeNumber = 0;
     while (Date.now() < deadline && cdp.isAlive() && !cleaning) {
       probeNumber++;
       recoveryState = 'probing-route';
-      const route = await probeProxyRoute();
+      const route = await probeExitCountry(cdp);
       trace('proxy_route_probe', {
         probeNumber,
         ok: !!route.ok,
@@ -1039,6 +1071,30 @@ async function main() {
     const stable = second.loggedIn && second.status === 200 &&
       second.country === first.country;
     return { ok: stable, state: second, previousCountry: first.country };
+  }
+
+  async function currentPageLocation() {
+    try {
+      const res = await cdp.send('Runtime.evaluate', {
+        expression: `JSON.stringify({path: location.pathname, hash: location.hash})`,
+        returnByValue: true, timeout: 3000
+      });
+      const location = JSON.parse(res.result?.value || '{}');
+      return {
+        path: typeof location.path === 'string' ? location.path : '/',
+        hash: typeof location.hash === 'string' ? location.hash : ''
+      };
+    } catch {
+      return { path: '/', hash: '' };
+    }
+  }
+
+  async function releaseOldRegionState(stage) {
+    try { await cdp.send('Network.clearBrowserCache'); } catch {}
+    try { await cdp.send('Network.closeIdleConnections'); } catch {}
+    const cleared = await clearRegionPinnedCookies(cdp);
+    trace('region_pinned_cookies_cleared', { stage, count: cleared.length });
+    await installSessionCookie(cdp, sessionToken);
   }
 
   async function warmUpChatGPTInBackground(routeCountry) {
@@ -1110,6 +1166,8 @@ async function main() {
       elapsedMs: route.elapsedMs
     });
 
+    activeRouteCountry = route.country;
+
     // Persisting the cookie is essential: header injection authenticates a
     // request but does not populate Chrome's cookie jar after an IP change.
     const stored = await installSessionCookie(cdp, sessionToken);
@@ -1118,18 +1176,18 @@ async function main() {
     recoveryState = 'verifying-current-page';
     const current = await verifyStableSession();
     if (current.ok && current.state.country === route.country) {
-      const state = current.state;
-      const oldCountry = lastKnownCountry;
-      lastKnownCountry = state.country;
-      console.log('  ✅ Existing page recovered without a refresh.');
-      console.log(`  🌍 Country: ${oldCountry || '?'} → ${state.country} (${currencyForCountry(state.country)})\n`);
-      trace('recovery_succeeded', { mode: 'no_navigation', country: state.country });
-      return state;
+      return acceptRecovery(current.state, route, 'no_navigation');
     }
 
-    // ChatGPT commonly uses the first document request after an IP change to
-    // invalidate the old regional edge session. Perform that request in a
-    // background target so the user's tab never displays the logged-out step.
+    // Drop the Cloudflare/device cookies issued for the previous exit IP,
+    // otherwise ChatGPT keeps serving the old region and its currency.
+    recoveryState = 'releasing-old-region';
+    console.log('  🧹 Clearing the edge cookies tied to the previous IP...');
+    await releaseOldRegionState('before_warmup');
+
+    // ChatGPT uses the first document request after an IP change to rebuild the
+    // regional edge session. Do that request in a background target so the
+    // visible tab never shows the logged-out intermediate state.
     recoveryState = 'background-warmup';
     console.log('  🔥 Priming ChatGPT session in the background...');
     await warmUpChatGPTInBackground(route.country);
@@ -1137,25 +1195,21 @@ async function main() {
 
     const afterWarmup = await verifyStableSession();
     if (afterWarmup.ok && afterWarmup.state.country === route.country) {
-      const state = afterWarmup.state;
-      const oldCountry = lastKnownCountry;
-      lastKnownCountry = state.country;
-      console.log('  ✅ Session recovered after background warm-up; no page refresh needed.');
-      console.log(`  🌍 Country: ${oldCountry || '?'} → ${state.country} (${currencyForCountry(state.country)})\n`);
-      trace('recovery_succeeded', { mode: 'background_warmup', country: state.country });
-      return state;
+      return acceptRecovery(afterWarmup.state, route, 'background_warmup');
     }
 
-    // Only now, after the proxy and cookie are ready, perform the one visible
-    // navigation. There is no blind visible retry loop.
+    // Only now, after the proxy, cookies, and edge session are ready, perform
+    // the single visible navigation. There is no blind visible retry loop.
     recoveryState = 'single-navigation';
-    console.log('  🔄 Proxy and session cookie are ready; refreshing ChatGPT once...');
+    console.log('  🔄 Proxy and session are ready; refreshing ChatGPT once...');
+    const previousLocation = await currentPageLocation();
     try { await cdp.send('Page.stopLoading'); } catch {}
     try { await cdp.send('Network.setCacheDisabled', { cacheDisabled: true }); } catch {}
-    try { await cdp.send('Network.clearBrowserCache'); } catch {}
-    await installSessionCookie(cdp, sessionToken);
+    await releaseOldRegionState('before_navigation');
 
-    const freshUrl = `https://chatgpt.com/?proxy_refresh=${Date.now()}`;
+    // Reloading the same path/hash lets the pricing view recompute its plans
+    // for the new region instead of restoring a cached view.
+    const freshUrl = `https://chatgpt.com${previousLocation.path}?proxy_refresh=${Date.now()}${previousLocation.hash}`;
     try { await cdp.send('Page.navigate', { url: freshUrl }); } catch {}
     const documentReady = await waitForChatGPTDocument(15000);
     if (!documentReady) {
@@ -1177,28 +1231,38 @@ async function main() {
       error: state.error || null
     });
 
-    if (verification.ok && state.country === route.country) {
-      const oldCountry = lastKnownCountry;
-      lastKnownCountry = state.country;
-      try {
-        await cdp.send('Runtime.evaluate', {
-          expression: `history.replaceState(null, '', '/')`,
-          returnByValue: true, timeout: 3000
-        });
-      } catch {}
-      console.log(`  ✅ Session restored on the first refresh${state.email ? `: ${state.email}` : ''}`);
-      console.log(`  🌍 Country: ${oldCountry || '?'} → ${state.country} (${currencyForCountry(state.country)})\n`);
-      trace('recovery_succeeded', { mode: 'single_navigation', country: state.country });
-      return state;
+    if (verification.ok) {
+      return acceptRecovery(state, route, 'single_navigation');
     }
 
     const detail = !state.loggedIn ? 'session endpoint is logged out' :
-      state.status !== 200 ? `country endpoint returned HTTP ${state.status || 0}` :
-      `ChatGPT country ${state.country || '?'} does not match proxy ${route.country}`;
+      `country endpoint returned HTTP ${state.status || 0}`;
     console.log(`  ⚠️ First refresh completed, but ${detail}.`);
     console.log(`     Diagnostics: ${diagnosticsPath}\n`);
     trace('recovery_failed', { stage: 'session_verification', detail });
     return null;
+  }
+
+  function acceptRecovery(state, route, mode) {
+    const oldCountry = lastKnownCountry;
+    lastKnownCountry = state.country;
+    activeRouteCountry = route.country;
+    const matchesRoute = state.country === route.country;
+
+    console.log(`  ✅ Session active${state.email ? `: ${state.email}` : ''}`);
+    if (matchesRoute) {
+      console.log(`  🌍 Country: ${oldCountry || '?'} → ${state.country} (${currencyForCountry(state.country)})\n`);
+    } else {
+      console.log(`  ⚠️ ChatGPT still reports ${state.country} while the connection exits from ${route.country}.`);
+      console.log(`     Checkout will use ${route.country} (${currencyForCountry(route.country)}); the plan cards may lag one refresh behind.\n`);
+    }
+    trace('recovery_succeeded', {
+      mode,
+      chatgptCountry: state.country,
+      routeCountry: route.country,
+      matchesRoute
+    });
+    return state;
   }
 
   function requestProxyRecovery(reason) {
@@ -1361,10 +1425,19 @@ async function main() {
     // ⭐ Detect country NOW (not at startup) so VPN/extension changes are picked up
     console.log('  🌍 Detecting current country (live)...');
     const detected = await detectCountry(cdp);
-    let country = 'US';
+    let country = activeRouteCountry || 'US';
     if (detected) {
       country = detected.country;
       console.log(`  ✓ ${country} (${currencyForCountry(country)}) via ${detected.source}`);
+      if (detected.drifted) {
+        console.log(`  ℹ️ ChatGPT still reports ${detected.accountCountry}; billing the exit IP country ${country} instead.`);
+      }
+      trace('checkout_country_selected', {
+        country,
+        source: detected.source,
+        chatgptCountry: detected.accountCountry || null,
+        drifted: !!detected.drifted
+      });
     } else {
       console.log('  ⚠️ Detection failed');
       awaitingInput = true;
