@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v7.8 - Slow route tolerant)
+ *   🎯 ChatGPT Manual Browser Smart (v7.9 - Focused signals)
+ *
+ *   v7.9 additions:
+ *     - Ignores third-party (ad/telemetry) transport failures
+ *     - Reuses the exit-IP provider that actually answers on this route
  *
  *   v7.8 additions:
  *     - Absorbs the slow first document of a new proxy in a background tab
@@ -376,6 +380,10 @@ const TIMEZONE_TO_COUNTRY = {
 };
 
 // ── Exit-IP country probe (the country the extension actually routes through) ──
+// Some providers stall behind certain proxies, so the last one that answered is
+// tried first to keep probes fast.
+let preferredExitProvider = null;
+
 async function probeExitCountry(cdp, sessionId = null) {
   const startedAt = Date.now();
   try {
@@ -388,6 +396,11 @@ async function probeExitCountry(cdp, sessionId = null) {
           {url:'https://ipwho.is/', field:'country_code', name:'ipwho.is'},
           {url:'https://ipinfo.io/json', field:'country', name:'ipinfo.io'}
         ];
+        const preferred = ${JSON.stringify(preferredExitProvider)};
+        if (preferred) {
+          const index = providers.findIndex(p => p.name === preferred);
+          if (index > 0) providers.unshift(providers.splice(index, 1)[0]);
+        }
         for (const provider of providers) {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 2500);
@@ -411,6 +424,7 @@ async function probeExitCountry(cdp, sessionId = null) {
     }, sessionId);
     const route = JSON.parse(res.result?.value || '{}');
     route.elapsedMs = Date.now() - startedAt;
+    if (route.ok && route.provider) preferredExitProvider = route.provider;
     return route;
   } catch (e) {
     return { ok: false, error: e.message, elapsedMs: Date.now() - startedAt };
@@ -681,6 +695,30 @@ function savePayLink(result, apiSession) {
   }
 }
 
+// Decides whether a failed request says anything about our own route. Ad and
+// telemetry frames fail through proxies constantly and must not start recovery.
+const ROUTE_FAILURE_ERRORS = /(ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED)/i;
+
+function classifyRequestFailure({ errorText = '', type = '', url = null }) {
+  if (!['Document', 'XHR', 'Fetch'].includes(type)) {
+    return { relevant: false, reason: 'resource type is not a document or API call' };
+  }
+
+  const routeFailure = ROUTE_FAILURE_ERRORS.test(errorText);
+  const mainDocumentTimeout = type === 'Document' && /ERR_TIMED_OUT/i.test(errorText);
+  if (!routeFailure && !mainDocumentTimeout) {
+    return { relevant: false, reason: 'error is not a route failure' };
+  }
+
+  let host = '';
+  try { host = url ? new URL(url).hostname : ''; } catch {}
+  if (/(^|\.)chatgpt\.com$/i.test(host)) return { relevant: true, host };
+  // This tab only ever navigates to chatgpt.com or about:blank, so an
+  // unidentified main-document failure is still ours.
+  if (!url && type === 'Document') return { relevant: true, host: null };
+  return { relevant: false, reason: 'third-party host', host: host || null };
+}
+
 const MAX_COOKIE_BYTES = 4096;
 
 async function installSessionCookie(cdp, sessionToken) {
@@ -783,7 +821,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v7.8 - Slow Route Tolerant)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v7.9 - Focused Signals)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -1943,10 +1981,22 @@ async function main() {
     if (autoReloadInProgress || cleaning || params.canceled) return;
     const error = params.errorText || '';
     const resourceType = params.type || '';
-    if (!['Document', 'XHR', 'Fetch'].includes(resourceType)) return;
-    const routeFailure = /(ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_NETWORK_CHANGED|ERR_INTERNET_DISCONNECTED)/i.test(error);
-    const mainDocumentTimeout = resourceType === 'Document' && /ERR_TIMED_OUT/i.test(error);
-    if (!routeFailure && !mainDocumentTimeout) return;
+    const failedUrl = inFlight.get(params.requestId)?.url || null;
+    inFlight.delete(params.requestId);
+
+    const verdict = classifyRequestFailure({ errorText: error, type: resourceType, url: failedUrl });
+    if (!verdict.relevant) {
+      if (ROUTE_FAILURE_ERRORS.test(error)) {
+        trace('transport_failure_ignored', {
+          error,
+          resourceType,
+          url: failedUrl,
+          host: verdict.host || null,
+          reason: verdict.reason
+        }, `↷ ignoring ${error} from ${verdict.host || resourceType || 'unknown'} (${verdict.reason})`);
+      }
+      return;
+    }
 
     const now = Date.now();
     if (now - lastTransportFailureAt < 4000) return;
@@ -1954,9 +2004,9 @@ async function main() {
     trace('transport_failure', {
       error,
       resourceType,
-      url: inFlight.get(params.requestId)?.url || null,
+      url: failedUrl,
       blockedReason: params.blockedReason || null
-    }, `⚡ transport failure ${error} (${resourceType})`);
+    }, `⚡ transport failure ${error} (${resourceType} ${shortenUrl(failedUrl || failedHost)})`);
     void requestProxyRecovery(error.replace(/^net::/, ''));
   });
 
