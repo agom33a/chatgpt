@@ -1555,6 +1555,7 @@ async function main() {
   let lastKnownCountry = initialCountry;
   let activeRouteCountry = null;
   let autoReloadInProgress = false;
+  let checkoutInProgress = false;
   let last401At = 0;
   let lastTransportFailureAt = 0;
   let challengeSeenAt = 0;
@@ -2324,6 +2325,11 @@ async function main() {
     if (cleaning || !cdp.isAlive()) return Promise.resolve(null);
     markActivity();
     pendingRecoveryReasons.add(reason);
+    if (checkoutInProgress) {
+      trace('recovery_deferred_for_checkout', { reason },
+        '↷ visible-page recovery deferred while isolated checkout is active');
+      return Promise.resolve(null);
+    }
     if (recoveryPromise) return recoveryPromise;
 
     cancelActiveQuestion();
@@ -2562,59 +2568,54 @@ async function main() {
       continue;
     }
 
-    // A recovery may have started while the question was open; the checkout has
-    // to run against a live ChatGPT document, never an error or blank page.
-    if (recoveryPromise) {
-      console.log('  ⏳ Waiting for the connection recovery to finish first...');
-      await recoveryPromise;
-    }
-    if (!await ensureChatGPTPageReady()) {
-      console.log('  ⚠️ ChatGPT is not reachable right now, so no pay link was requested.');
-      console.log('     The prompt returns once the page is healthy again.\n');
-      handled = false;
-      lastOfferSeen = false;
-      continue;
-    }
+    // Checkout readiness is intentionally independent of recoveryPromise and
+    // the visible renderer. The disposable target shares the default browser
+    // context (cookies + extension route) but never navigates the user's tab.
+    console.log(`  ⏳ Preparing isolated API checkout (Plus${isTrial ? ', no trial' : ''})...`);
+    checkoutInProgress = true;
+    try {
+      const result = await runIsolatedCheckout({
+        cdp,
+        apiSession,
+        currencyForCountry,
+        trace,
+        confirm: async detected => {
+          const successful = detected.observations
+            .filter(item => item.ok && item.country)
+            .map(item => `${item.provider}=${item.country}`)
+            .join(', ');
+          console.log(`  🌍 Exit-country probes: ${successful || 'none answered'}`);
 
-    // ⭐ Detect country NOW (not at startup) so VPN/extension changes are picked up
-    console.log('  🌍 Detecting current country (live)...');
-    const detected = await detectCountry(cdp);
-    let country = activeRouteCountry || null;
-    if (detected && detected.reliable) {
-      country = detected.country;
-      console.log(`  ✓ ${country} (${currencyForCountry(country)}) via ${detected.source}`);
-      if (detected.drifted) {
-        console.log(`  ℹ️ ChatGPT still reports ${detected.accountCountry}; billing the exit IP country ${country} instead.`);
-      }
-      trace('checkout_country_selected', {
-        country,
-        source: detected.source,
-        chatgptCountry: detected.accountCountry || null,
-        drifted: !!detected.drifted
+          let country = detected.country || activeRouteCountry || null;
+          if (!detected.reliable) {
+            console.log(`  ⚠️ Country quorum was not reached (${detected.agreeingProviders}/2 providers agree).`);
+            awaitingInput = true;
+            const manual = ((await ask(
+              `  Enter billing country (2-letter code${country ? `, Enter=${country}` : ''}): `
+            )) || '').toUpperCase().trim();
+            awaitingInput = false;
+            if (/^[A-Z]{2}$/.test(manual)) country = manual;
+          } else {
+            console.log(`  ✓ ${country} confirmed by ${detected.agreeingProviders} exit-IP providers.`);
+          }
+          if (!/^[A-Z]{2}$/.test(country || '')) return { confirmed: false };
+
+          awaitingInput = true;
+          const approval = await ask(
+            `  Confirm Plus checkout for ${country} (${currencyForCountry(country)})? [y/N]: `
+          );
+          awaitingInput = false;
+          return {
+            confirmed: approval !== null && /^(y|yes)$/i.test(approval.trim()),
+            country
+          };
+        }
       });
-    } else {
-      const guess = detected?.country || country;
-      console.log(`  ⚠️ Could not confirm the country from the connection${detected ? ` (only ${detected.source} available)` : ''}.`);
-      trace('checkout_country_unreliable', {
-        guess: guess || null,
-        source: detected?.source || null
-      });
-      awaitingInput = true;
-      const manual = ((await ask(`  Enter the billing country (2-letter code${guess ? `, Enter=${guess}` : ''}): `)) || '').toUpperCase().trim();
-      awaitingInput = false;
-      if (/^[A-Z]{2}$/.test(manual)) country = manual;
-      else country = guess;
-      if (!country) {
-        console.log('  ⏭️  No country confirmed, so no pay link was requested.\n');
+      if (result.cancelled) {
+        console.log('  ⏭️  Checkout was not requested because country confirmation was declined.\n');
         handled = true;
         continue;
       }
-      console.log(`  ✓ Using: ${country} (${currencyForCountry(country)})`);
-    }
-
-    console.log(`  ⏳ Generating direct pay link (Plus${isTrial ? ', no trial' : ''})...`);
-    try {
-      const result = await generateDirectPayLink(cdp, apiSession, country);
       console.log(`  ✅ Pay link generated!`);
       console.log(`     Country:  ${result.country}`);
       console.log(`     Currency: ${result.currency}`);
@@ -2628,12 +2629,25 @@ async function main() {
 
       console.log('  🌐 Opening in new tab...');
       await openInNewTab(cdp, result.url);
-      console.log('  ✅ Done! Complete payment in the new tab.\n');
+      console.log('  ✅ Checkout is ready. Payment still requires your confirmation in the new tab.');
+
+      const visible = await currentPageLocation();
+      if (!visible.onChatGPT) {
+        awaitingInput = true;
+        const repair = await ask('  Visible ChatGPT tab is unhealthy. Try to repair it now? [y/N]: ');
+        awaitingInput = false;
+        if (repair !== null && /^(y|yes)$/i.test(repair.trim())) {
+          await ensureChatGPTPageReady();
+        }
+      }
+      console.log('');
       handled = true;
     } catch (e) {
       console.log(`  ❌ Failed: ${e.message}`);
       console.log('  ↩️  Will retry if the offer reappears.\n');
       handled = true;
+    } finally {
+      checkoutInProgress = false;
     }
   }
 
