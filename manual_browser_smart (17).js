@@ -1,7 +1,15 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v7.3 - Region-accurate checkout)
+ *   🎯 ChatGPT Manual Browser Smart (v7.4 - Full trace stream)
+ *
+ *   v7.4 additions:
+ *     - Prints every request/response with exit IP, protocol, and duration
+ *     - Reports blocked cookies, set-cookie names, and cookie rotations
+ *     - Streams navigation, console, and browser log events
+ *     - Logs recovery state transitions and a 10s exit-IP/region snapshot
+ *     - Redacts cookie/authorization values to fingerprints
+ *     - TRACE=0 silences output, TRACE_ASSETS=1 includes asset traffic
  *
  *   v7.3 additions:
  *     - Bills the country of the real exit IP, not ChatGPT's cached region
@@ -77,6 +85,37 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const readline = require('readline');
+const crypto = require('crypto');
+
+// Full-visibility tracing. TRACE=0 silences the stream, TRACE_ASSETS=1 also
+// prints successful images/fonts/scripts (very noisy, off by default).
+const TRACE_ENABLED = process.env.TRACE !== '0';
+const TRACE_ASSETS = process.env.TRACE_ASSETS === '1';
+const ASSET_TYPES = new Set(['Image', 'Font', 'Stylesheet', 'Media', 'Manifest', 'Script', 'Prefetch']);
+const SECRET_HEADERS = new Set(['cookie', 'set-cookie', 'authorization', 'proxy-authorization']);
+const startedAt = Date.now();
+
+const fingerprint = value =>
+  value ? crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 8) : 'none';
+
+const elapsedStamp = () => `${((Date.now() - startedAt) / 1000).toFixed(3).padStart(9)}s`;
+
+const shortenUrl = (url, max = 96) => {
+  try {
+    const parsed = new URL(url);
+    const tail = parsed.pathname + parsed.search.slice(0, 40);
+    const text = parsed.hostname + tail;
+    return text.length > max ? text.slice(0, max) + '…' : text;
+  } catch {
+    return String(url).slice(0, max);
+  }
+};
+
+const redactHeaders = headers => Object.fromEntries(
+  Object.entries(headers || {}).map(([name, value]) => SECRET_HEADERS.has(name.toLowerCase())
+    ? [name, `<redacted ${String(value).length}b fp=${fingerprint(value)}>`]
+    : [name, String(value).slice(0, 200)])
+);
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 process.on('uncaughtException', e => {
@@ -235,17 +274,31 @@ function startProxyRelay(proxyStr, localPort) {
 
 let sharedRL = null;
 let activeQuestionAbort = null;
+let activePrompt = null;
 function getRL() {
   if (!sharedRL) sharedRL = readline.createInterface({ input: process.stdin, output: process.stdout });
   return sharedRL;
 }
+
+// Keep the trace stream and an open question from overwriting each other.
+function writeLine(text) {
+  if (activePrompt && sharedRL) {
+    process.stdout.write('\r\u001b[2K' + text + '\n');
+    process.stdout.write(activePrompt + (sharedRL.line || ''));
+    return;
+  }
+  process.stdout.write(text + '\n');
+}
+
 function ask(q) {
+  activePrompt = q.split('\n').pop();
   return new Promise(resolve => {
     const controller = new AbortController();
     let settled = false;
     const finish = value => {
       if (settled) return;
       settled = true;
+      activePrompt = null;
       if (activeQuestionAbort === cancel) activeQuestionAbort = null;
       resolve(value);
     };
@@ -564,16 +617,23 @@ async function installSessionCookie(cdp, sessionToken) {
   }
 }
 
-// Cloudflare and OpenAI device cookies are issued for the previous exit IP and
-// keep pinning the old regional edge (and its currency) after a country switch.
-const REGION_PINNED_COOKIES = [
-  '__cf_bm', '_cfuvid', 'cf_clearance',
-  'oai-did', 'oai-hlib', 'oai-sc', 'oai-allow-ne', 'oai-nav-state'
+// Load-balancer and region-affinity cookies keep routing the session to the
+// edge chosen for the previous exit IP, which preserves the old currency.
+const EDGE_AFFINITY_COOKIES = [
+  '__oailb', '__cflb', 'oai-hlib', 'oai-sc', 'oai-allow-ne', 'oai-nav-state'
 ];
 
-async function clearRegionPinnedCookies(cdp) {
+// Cloudflare's bot-management and clearance cookies are refreshed automatically
+// on a new IP. Deleting them proactively only invites a challenge, so they are
+// dropped solely after a challenge has already been observed.
+const CHALLENGE_COOKIES = ['__cf_bm', '_cfuvid', 'cf_clearance'];
+
+async function clearRegionPinnedCookies(cdp, includeChallenge = false) {
+  const names = includeChallenge
+    ? [...EDGE_AFFINITY_COOKIES, ...CHALLENGE_COOKIES]
+    : EDGE_AFFINITY_COOKIES;
   const cleared = [];
-  for (const name of REGION_PINNED_COOKIES) {
+  for (const name of names) {
     for (const domain of ['chatgpt.com', '.chatgpt.com']) {
       try {
         await cdp.send('Network.deleteCookies', { name, domain, path: '/' });
@@ -598,20 +658,28 @@ async function readSessionCookie(cdp) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v7.3 - Region-Accurate Checkout)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v7.4 - Full Trace Stream)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
   try { fs.writeFileSync(diagnosticsPath, ''); } catch {}
-  const trace = (event, details = {}) => {
+
+  // Every event goes to the file; TRACE also mirrors it to the terminal so the
+  // cause of a stuck country switch is observed instead of guessed.
+  const trace = (event, details = {}, line = null) => {
     try {
       fs.appendFileSync(diagnosticsPath, JSON.stringify({
         at: new Date().toISOString(),
+        sinceStartMs: Date.now() - startedAt,
         event,
         ...details
       }) + '\n');
     } catch {}
+    if (TRACE_ENABLED && line) writeLine(`  ${elapsedStamp()} ${line}`);
   };
+
+  console.log(`  🧾 Trace stream: ${TRACE_ENABLED ? 'ON' : 'OFF'} (TRACE=0 to silence, TRACE_ASSETS=1 for asset traffic)`);
+  console.log(`  🗂️  Diagnostics file: ${diagnosticsPath}\n`);
 
   if (!fs.existsSync('./session_api.json')) {
     console.error('❌ session_api.json not found');
@@ -799,20 +867,160 @@ async function main() {
   async function syncActiveSessionCookie(source) {
     const browserToken = await readSessionCookie(cdp);
     if (!browserToken || browserToken === sessionToken) return false;
+    const previousFingerprint = fingerprint(sessionToken);
     sessionToken = browserToken;
     trace('session_cookie_rotated', {
       source,
+      previousFingerprint,
+      fingerprint: fingerprint(sessionToken),
       cookieSize: sessionToken.length + COOKIE_NAME.length + 1
-    });
+    }, `🔑 session cookie rotated (${source}): ${previousFingerprint} → ${fingerprint(sessionToken)}`);
     return true;
   }
 
+  try { await cdp.send('Log.enable'); } catch {}
+
+  // ── Full-visibility event stream ──────────────────────────────────────────
+  const inFlight = new Map(); // requestId → { url, type, method, startedAt }
+  const isAsset = type => ASSET_TYPES.has(type);
+
+  cdp.on('Network.requestWillBeSent', params => {
+    const url = params.request?.url || '';
+    const type = params.type || 'Other';
+    inFlight.set(params.requestId, {
+      url,
+      type,
+      method: params.request?.method || 'GET',
+      startedAt: Date.now()
+    });
+    if (isAsset(type) && !TRACE_ASSETS) return;
+    trace('request', {
+      requestId: params.requestId,
+      method: params.request?.method,
+      type,
+      url,
+      headers: redactHeaders(params.request?.headers)
+    }, `→ ${params.request?.method || 'GET'} ${type} ${shortenUrl(url)}`);
+  });
+
+  cdp.on('Network.requestWillBeSentExtraInfo', params => {
+    const blocked = (params.associatedCookies || [])
+      .filter(entry => (entry.blockedReasons || []).length)
+      .map(entry => `${entry.cookie?.name}:${(entry.blockedReasons || []).join('|')}`);
+    if (!blocked.length) return;
+    trace('cookies_blocked_on_request', {
+      requestId: params.requestId,
+      blocked
+    }, `🚫 cookies blocked → ${blocked.join(', ')}`);
+  });
+
+  cdp.on('Network.responseReceived', params => {
+    const info = inFlight.get(params.requestId);
+    const type = params.type || info?.type || 'Other';
+    const response = params.response || {};
+    const durationMs = info ? Date.now() - info.startedAt : null;
+    if (isAsset(type) && !TRACE_ASSETS && response.status < 400) return;
+    trace('response', {
+      requestId: params.requestId,
+      status: response.status,
+      type,
+      url: response.url,
+      remoteIP: response.remoteIPAddress || null,
+      protocol: response.protocol || null,
+      fromDiskCache: !!response.fromDiskCache,
+      fromServiceWorker: !!response.fromServiceWorker,
+      durationMs,
+      headers: redactHeaders(response.headers)
+    }, `← ${response.status} ${type} ${shortenUrl(response.url)} ip=${response.remoteIPAddress || '?'}${durationMs === null ? '' : ` ${durationMs}ms`}`);
+  });
+
+  cdp.on('Network.loadingFinished', params => {
+    inFlight.delete(params.requestId);
+  });
+
+  // A Cloudflare challenge looks like a logged-out session unless it is named.
+  cdp.on('Network.responseReceived', params => {
+    const response = params.response || {};
+    if (response.status !== 403 && response.status !== 503) return;
+    if (!/chatgpt\.com/i.test(response.url || '')) return;
+    const headers = Object.fromEntries(
+      Object.entries(response.headers || {}).map(([k, v]) => [k.toLowerCase(), String(v)])
+    );
+    const mitigated = headers['cf-mitigated'] || null;
+    const isHtml = /text\/html/i.test(headers['content-type'] || '');
+    if (!mitigated && !isHtml) return;
+    challengeSeenAt = Date.now();
+    trace('cloudflare_challenge', {
+      status: response.status,
+      url: response.url,
+      mitigated,
+      remoteIP: response.remoteIPAddress || null
+    }, `🛡️  Cloudflare challenge ${response.status}${mitigated ? ` (${mitigated})` : ''} on ${shortenUrl(response.url)}`);
+  });
+
   cdp.on('Network.responseReceivedExtraInfo', params => {
-    const hasSetCookie = Object.keys(params.headers || {})
-      .some(name => name.toLowerCase() === 'set-cookie');
-    if (hasSetCookie) {
+    const setCookieNames = String(params.headers?.['set-cookie'] || params.headers?.['Set-Cookie'] || '')
+      .split('\n')
+      .map(line => line.split('=')[0].trim())
+      .filter(Boolean);
+    const blocked = (params.blockedCookies || [])
+      .map(entry => `${entry.cookie?.name || entry.cookieLine?.split('=')[0]}:${(entry.blockedReasons || []).join('|')}`);
+
+    if (setCookieNames.length || blocked.length) {
+      trace('response_cookies', {
+        requestId: params.requestId,
+        setCookieNames,
+        blocked
+      }, `🍪 set-cookie [${setCookieNames.join(', ') || 'none'}]${blocked.length ? ` blocked [${blocked.join(', ')}]` : ''}`);
+    }
+    if (setCookieNames.includes(COOKIE_NAME)) {
       setTimeout(() => { void syncActiveSessionCookie('set-cookie response'); }, 0);
     }
+  });
+
+  cdp.on('Page.frameNavigated', params => {
+    if (params.frame?.parentId) return;
+    trace('frame_navigated', {
+      url: params.frame?.url,
+      status: params.frame?.unreachableUrl ? 'unreachable' : 'ok'
+    }, `🧭 navigated ${shortenUrl(params.frame?.url || '')}`);
+  });
+
+  cdp.on('Page.domContentEventFired', () => {
+    trace('dom_content_loaded', {}, '📄 DOMContentLoaded');
+  });
+
+  cdp.on('Page.loadEventFired', () => {
+    trace('load_event', {}, '📄 load event fired');
+  });
+
+  cdp.on('Runtime.exceptionThrown', params => {
+    const detail = params.exceptionDetails || {};
+    trace('page_exception', {
+      text: detail.text,
+      message: detail.exception?.description?.slice(0, 300) || null,
+      url: detail.url || null
+    }, `💥 page exception: ${(detail.exception?.description || detail.text || '').split('\n')[0].slice(0, 160)}`);
+  });
+
+  cdp.on('Runtime.consoleAPICalled', params => {
+    if (!['error', 'warning', 'assert'].includes(params.type)) return;
+    const text = (params.args || [])
+      .map(arg => arg.value ?? arg.description ?? arg.type)
+      .join(' ')
+      .slice(0, 220);
+    trace('page_console', { level: params.type, text }, `🖥️  console.${params.type}: ${text}`);
+  });
+
+  cdp.on('Log.entryAdded', params => {
+    const entry = params.entry || {};
+    if (!['error', 'warning'].includes(entry.level)) return;
+    trace('browser_log', {
+      level: entry.level,
+      source: entry.source,
+      text: entry.text,
+      url: entry.url || null
+    }, `📕 ${entry.source}/${entry.level}: ${String(entry.text).slice(0, 200)}`);
   });
 
   try {
@@ -842,25 +1050,32 @@ async function main() {
   let timeoutCounter = 0;
   let errorCounter = 0;
 
-  // Short URL for logging
-  const shortUrl = (u) => {
-    try {
-      const p = new URL(u);
-      return p.hostname + p.pathname.slice(0, 60);
-    } catch { return u.slice(0, 80); }
-  };
+  const shortUrl = url => shortenUrl(url, 60);
 
   cdp.on('Fetch.requestPaused', async (params) => {
     const requestId = params.requestId;
     const url = params.request?.url || '';
     const shouldInject = /^https:\/\/([a-z0-9-]+\.)?chatgpt\.com\//i.test(url);
     const short = shortUrl(url);
+    const resourceType = params.resourceType || 'Other';
     requestCounter++;
+
+    if (!isAsset(resourceType) || TRACE_ASSETS) {
+      trace('fetch_intercepted', {
+        requestId,
+        method: params.request?.method,
+        resourceType,
+        url,
+        inject: shouldInject,
+        cookieFingerprint: shouldInject ? fingerprint(sessionToken) : null
+      }, `⇢ intercept ${params.request?.method || 'GET'} ${resourceType} ${short}${shouldInject ? ` inject=${fingerprint(sessionToken)}` : ' inject=no'}`);
+    }
 
     // Timeout timer
     const rescueTimer = setTimeout(async () => {
       timeoutCounter++;
-      console.log(`  ⏱️  [TIMEOUT ${timeoutCounter}] ${short}`);
+      trace('fetch_rescue_timeout', { requestId, url, timeoutCounter },
+        `⏱️  rescue timeout #${timeoutCounter} ${short}`);
       try { await cdp.send('Fetch.failRequest', { requestId, errorReason: 'TimedOut' }); } catch {}
       pausedRequests.delete(requestId);
     }, 8000);
@@ -891,37 +1106,41 @@ async function main() {
       clearTimeout(rescueTimer);
       pausedRequests.delete(requestId);
       errorCounter++;
-      console.log(`  ❌ [ERROR ${errorCounter}] ${short} — ${e.message}`);
+      trace('fetch_intercept_error', { requestId, url, error: e.message },
+        `❌ intercept error #${errorCounter} ${short} — ${e.message}`);
       try { await cdp.send('Fetch.continueRequest', { requestId }); }
       catch { try { await cdp.send('Fetch.failRequest', { requestId, errorReason: 'Failed' }); } catch {} }
     }
   });
 
-  // ⭐ v5.8: Silence background logs while asking the user something
+  // Tracks whether a question is open; the trace stream redraws it after logs.
   let awaitingInput = false;
 
   // ⭐ Leak detector: report if too many requests stuck
   const leakDetector = setInterval(() => {
-    if (awaitingInput) return;
     const pending = pausedRequests.size;
     if (pending > 10) {
-      console.log(`  ⚠️  WARNING: ${pending} requests currently paused (possible VPN switch, will auto-recover in 8s)`);
-      const sorted = [...pausedRequests.entries()]
-        .sort((a, b) => a[1].startedAt - b[1].startedAt).slice(0, 3);
-      for (const [id, info] of sorted) {
-        const age = Math.round((Date.now() - info.startedAt) / 1000);
-        console.log(`      → [${age}s old] ${shortUrl(info.url)}`);
-      }
+      const oldest = [...pausedRequests.values()]
+        .sort((a, b) => a.startedAt - b.startedAt)
+        .slice(0, 3)
+        .map(info => `${Math.round((Date.now() - info.startedAt) / 1000)}s:${shortUrl(info.url)}`);
+      trace('paused_request_backlog', { pending, oldest },
+        `⚠️  ${pending} paused requests | oldest ${oldest.join(' , ')}`);
     }
   }, 5000);
 
-  // ⭐ Stats reporter every 30s
+  // ⭐ Stats reporter
   const statsReporter = setInterval(() => {
-    if (awaitingInput) return;
-    if (requestCounter > 0) {
-      console.log(`  📊 Requests: ${requestCounter} total | ${successCounter} ok | ${timeoutCounter} timeout | ${errorCounter} error | ${pausedRequests.size} pending`);
-    }
-  }, 30000);
+    if (requestCounter === 0) return;
+    trace('request_stats', {
+      total: requestCounter,
+      ok: successCounter,
+      timeouts: timeoutCounter,
+      errors: errorCounter,
+      pending: pausedRequests.size,
+      inFlight: inFlight.size
+    }, `📊 requests ${requestCounter} total | ${successCounter} ok | ${timeoutCounter} timeout | ${errorCounter} error | ${pausedRequests.size} paused`);
+  }, 15000);
 
   console.log('  ✅ Interceptor ready (request rescue: 8s, verbose logging on)\n');
 
@@ -987,9 +1206,20 @@ async function main() {
   let autoReloadInProgress = false;
   let last401At = 0;
   let lastTransportFailureAt = 0;
+  let challengeSeenAt = 0;
   let recoveryPromise = null;
   let recoveryState = 'idle';
+  let recoveryStateSince = Date.now();
   const pendingRecoveryReasons = new Set();
+
+  const setRecoveryState = next => {
+    if (recoveryState === next) return;
+    const heldMs = Date.now() - recoveryStateSince;
+    trace('recovery_state', { from: recoveryState, to: next, heldMs },
+      `🧭 recovery state ${recoveryState} → ${next} (${heldMs}ms)`);
+    recoveryState = next;
+    recoveryStateSince = Date.now();
+  };
 
   // Probe the freshly loaded page instead of assuming that Page.reload means
   // the session has recovered. During a proxy switch ChatGPT commonly returns
@@ -997,13 +1227,37 @@ async function main() {
   async function probeChatGPTSession(sessionId = null) {
     try {
       const res = await cdp.send('Runtime.evaluate', {
-        expression: `Promise.all([
-          fetch('/api/auth/session',{credentials:'include',cache:'no-store'})
-            .then(r=>r.json()).then(d=>({loggedIn:!!(d&&d.user),email:d?.user?.email||null})),
-          fetch('/backend-api/me',{credentials:'include',cache:'no-store'})
-            .then(async r=>({status:r.status,country:r.ok?(await r.json().catch(()=>({}))).country||null:null}))
-        ]).then(([session,me])=>JSON.stringify({...session,...me}))
-          .catch(e=>JSON.stringify({status:0,error:e.message}))`,
+        expression: `(async () => {
+          const read = async url => {
+            try {
+              const response = await fetch(url, {credentials:'include', cache:'no-store'});
+              const text = await response.text();
+              let json = null;
+              try { json = JSON.parse(text); } catch {}
+              return {
+                status: response.status,
+                json,
+                html: json === null && /^\\s*</.test(text),
+                snippet: json === null ? text.slice(0, 80) : null
+              };
+            } catch (e) {
+              return { status: 0, json: null, html: false, snippet: e.message };
+            }
+          };
+          const [session, me] = await Promise.all([
+            read('/api/auth/session'),
+            read('/backend-api/me')
+          ]);
+          return JSON.stringify({
+            loggedIn: !!session.json?.user,
+            email: session.json?.user?.email || null,
+            sessionStatus: session.status,
+            status: me.status,
+            country: me.json?.country || null,
+            challenge: session.html || me.html,
+            snippet: session.snippet || me.snippet || null
+          });
+        })()`,
         awaitPromise: true, returnByValue: true, timeout: 12000
       }, sessionId);
       return JSON.parse(res.result?.value || '{}');
@@ -1012,47 +1266,65 @@ async function main() {
     }
   }
 
-  async function waitForHealthyProxyRoute(previousCountry, timeoutMs = 45000) {
-    const deadline = Date.now() + timeoutMs;
+  // Waits for a usable route. A changed exit country is preferred, but an
+  // unchanged one still counts once the change window passes, so an auth-only
+  // failure is not stuck waiting for a country that never changes.
+  async function waitForHealthyProxyRoute(previousCountry, timeoutMs = 45000, changeWindowMs = 6000) {
+    const startedProbingAt = Date.now();
+    const deadline = startedProbingAt + timeoutMs;
     let probeNumber = 0;
+    let lastHealthy = null;
+
     while (Date.now() < deadline && cdp.isAlive() && !cleaning) {
       probeNumber++;
-      recoveryState = 'probing-route';
+      setRecoveryState('probing-route');
       const route = await probeExitCountry(cdp);
+      const changed = route.ok && (!previousCountry || route.country !== previousCountry);
       trace('proxy_route_probe', {
         probeNumber,
         ok: !!route.ok,
         country: route.country || null,
         provider: route.provider || null,
+        changed,
         elapsedMs: route.elapsedMs,
         error: route.error || null
-      });
-      if (route.ok && (!previousCountry || route.country !== previousCountry)) return route;
+      }, `🛰️  route probe #${probeNumber} ${route.ok ? route.country : 'unreachable'}${route.ok && !changed ? ' (unchanged)' : ''} ${route.elapsedMs}ms`);
+
+      if (changed) return { ...route, changed: true };
       if (route.ok) {
-        trace('proxy_route_healthy_but_unchanged', {
-          country: route.country,
-          previousCountry
-        });
+        lastHealthy = route;
+        if (Date.now() - startedProbingAt >= changeWindowMs) {
+          trace('proxy_route_unchanged_accepted', {
+            country: route.country,
+            previousCountry,
+            waitedMs: Date.now() - startedProbingAt
+          }, `🛰️  exit country stayed ${route.country}; continuing recovery`);
+          return { ...route, changed: false };
+        }
       }
-      await sleep(500);
+      await sleep(800);
     }
-    return null;
+    return lastHealthy ? { ...lastHealthy, changed: false } : null;
   }
 
-  async function waitForChatGPTDocument(timeoutMs = 10000, sessionId = null) {
+  // expectedMarker guards against reading the previous document: without it a
+  // still-loaded old page reports "complete" before the new navigation commits.
+  async function waitForChatGPTDocument(timeoutMs = 10000, sessionId = null, expectedMarker = null) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline && cdp.isAlive()) {
       try {
         const res = await cdp.send('Runtime.evaluate', {
           expression: `JSON.stringify({
             host: location.hostname,
+            href: location.href,
             ready: document.readyState,
             hasBody: !!document.body
           })`,
           returnByValue: true, timeout: 3000
         }, sessionId);
         const page = JSON.parse(res.result?.value || '{}');
-        if (page.host === 'chatgpt.com' && page.hasBody &&
+        const committed = !expectedMarker || String(page.href || '').includes(expectedMarker);
+        if (page.host === 'chatgpt.com' && page.hasBody && committed &&
             (page.ready === 'interactive' || page.ready === 'complete')) return true;
       } catch {}
       await sleep(350);
@@ -1092,8 +1364,10 @@ async function main() {
   async function releaseOldRegionState(stage) {
     try { await cdp.send('Network.clearBrowserCache'); } catch {}
     try { await cdp.send('Network.closeIdleConnections'); } catch {}
-    const cleared = await clearRegionPinnedCookies(cdp);
-    trace('region_pinned_cookies_cleared', { stage, count: cleared.length });
+    const includeChallenge = challengeSeenAt > 0 && Date.now() - challengeSeenAt < 60000;
+    const cleared = await clearRegionPinnedCookies(cdp, includeChallenge);
+    trace('region_pinned_cookies_cleared', { stage, count: cleared.length, includeChallenge },
+      `🧹 cleared ${cleared.length} IP-pinned cookie entries (${stage}${includeChallenge ? ', incl. challenge clearance' : ''})`);
     await installSessionCookie(cdp, sessionToken);
   }
 
@@ -1119,10 +1393,11 @@ async function main() {
         await cdp.send('Network.setBypassServiceWorker', { bypass: true }, sessionId);
       } catch {}
 
+      const warmupMarker = `proxy_warmup=${Date.now()}`;
       await cdp.send('Page.navigate', {
-        url: `https://chatgpt.com/?proxy_warmup=${Date.now()}`
+        url: `https://chatgpt.com/?${warmupMarker}`
       }, sessionId);
-      const ready = await waitForChatGPTDocument(12000, sessionId);
+      const ready = await waitForChatGPTDocument(12000, sessionId, warmupMarker);
       const state = ready ? await probeChatGPTSession(sessionId) : { status: 0 };
       trace('background_warmup', {
         ready,
@@ -1144,14 +1419,21 @@ async function main() {
   }
 
   async function performRecovery(reasons) {
-    recoveryState = 'probing-route';
-    console.log(`\n  🔌 Network transition detected: ${reasons.join(', ')}`);
-    console.log('  🔎 Checking the new proxy invisibly before touching the page...');
-    trace('recovery_started', { reasons });
+    setRecoveryState('probing-route');
+    trace('recovery_started', { reasons, knownCountry: lastKnownCountry },
+      `🔌 recovery started: ${reasons.join(', ')}`);
 
     // Force the health check to open a fresh route through the extension.
     try { await cdp.send('Network.closeIdleConnections'); } catch {}
-    const route = await waitForHealthyProxyRoute(lastKnownCountry);
+
+    // A dropped tunnel means the extension is mid-switch, so allow more time
+    // for the new exit country; an auth-only failure needs far less.
+    const routeChangeExpected = reasons.some(reason => /ERR_|tunnel|connection|network/i.test(reason));
+    const route = await waitForHealthyProxyRoute(
+      lastKnownCountry,
+      45000,
+      routeChangeExpected ? 6000 : 2000
+    );
     if (!route) {
       console.log('  ⚠️ The selected proxy did not become reachable within 45 seconds.');
       console.log(`     Diagnostics: ${diagnosticsPath}\n`);
@@ -1159,59 +1441,83 @@ async function main() {
       return null;
     }
 
-    console.log(`  ✅ Proxy route ready: ${route.country} via ${route.provider} (${route.elapsedMs}ms)`);
     trace('proxy_route_ready', {
       country: route.country,
       provider: route.provider,
+      changed: route.changed,
       elapsedMs: route.elapsedMs
-    });
+    }, `✅ route ready: ${route.country} via ${route.provider} (${route.elapsedMs}ms${route.changed ? ', country changed' : ', country unchanged'})`);
 
     activeRouteCountry = route.country;
 
     // Persisting the cookie is essential: header injection authenticates a
     // request but does not populate Chrome's cookie jar after an IP change.
     const stored = await installSessionCookie(cdp, sessionToken);
-    trace('session_cookie_reinstall', { success: stored, cookieSize });
+    trace('session_cookie_reinstall', {
+      success: stored,
+      cookieSize,
+      fingerprint: fingerprint(sessionToken)
+    }, `🍪 session cookie reinstalled (fp=${fingerprint(sessionToken)}, stored=${stored})`);
 
-    recoveryState = 'verifying-current-page';
+    setRecoveryState('verifying-current-page');
     const current = await verifyStableSession();
+    trace('current_page_verification', {
+      ok: current.ok,
+      loggedIn: !!current.state?.loggedIn,
+      status: current.state?.status || 0,
+      country: current.state?.country || null,
+      challenge: !!current.state?.challenge,
+      routeCountry: route.country
+    }, `🔍 current page: loggedIn=${!!current.state?.loggedIn} me=${current.state?.status || 0} country=${current.state?.country || '?'}${current.state?.challenge ? ' challenge=yes' : ''}`);
     if (current.ok && current.state.country === route.country) {
       return acceptRecovery(current.state, route, 'no_navigation');
     }
 
     // Drop the Cloudflare/device cookies issued for the previous exit IP,
     // otherwise ChatGPT keeps serving the old region and its currency.
-    recoveryState = 'releasing-old-region';
-    console.log('  🧹 Clearing the edge cookies tied to the previous IP...');
+    setRecoveryState('releasing-old-region');
     await releaseOldRegionState('before_warmup');
 
     // ChatGPT uses the first document request after an IP change to rebuild the
     // regional edge session. Do that request in a background target so the
     // visible tab never shows the logged-out intermediate state.
-    recoveryState = 'background-warmup';
-    console.log('  🔥 Priming ChatGPT session in the background...');
+    setRecoveryState('background-warmup');
+    trace('background_warmup_started', { routeCountry: route.country },
+      '🔥 priming ChatGPT session in a background tab');
     await warmUpChatGPTInBackground(route.country);
     await installSessionCookie(cdp, sessionToken);
 
     const afterWarmup = await verifyStableSession();
+    trace('warmup_verification', {
+      ok: afterWarmup.ok,
+      loggedIn: !!afterWarmup.state?.loggedIn,
+      status: afterWarmup.state?.status || 0,
+      country: afterWarmup.state?.country || null,
+      challenge: !!afterWarmup.state?.challenge,
+      routeCountry: route.country
+    }, `🔍 after warm-up: loggedIn=${!!afterWarmup.state?.loggedIn} me=${afterWarmup.state?.status || 0} country=${afterWarmup.state?.country || '?'}${afterWarmup.state?.challenge ? ' challenge=yes' : ''}`);
     if (afterWarmup.ok && afterWarmup.state.country === route.country) {
       return acceptRecovery(afterWarmup.state, route, 'background_warmup');
     }
 
     // Only now, after the proxy, cookies, and edge session are ready, perform
     // the single visible navigation. There is no blind visible retry loop.
-    recoveryState = 'single-navigation';
-    console.log('  🔄 Proxy and session are ready; refreshing ChatGPT once...');
+    setRecoveryState('single-navigation');
     const previousLocation = await currentPageLocation();
+    trace('single_navigation_started', {
+      routeCountry: route.country,
+      page: `${previousLocation.path}${previousLocation.hash}`
+    }, `🔄 refreshing ChatGPT once on ${previousLocation.path}${previousLocation.hash}`);
     try { await cdp.send('Page.stopLoading'); } catch {}
     try { await cdp.send('Network.setCacheDisabled', { cacheDisabled: true }); } catch {}
     await releaseOldRegionState('before_navigation');
 
     // Reloading the same path/hash lets the pricing view recompute its plans
     // for the new region instead of restoring a cached view.
-    const freshUrl = `https://chatgpt.com${previousLocation.path}?proxy_refresh=${Date.now()}${previousLocation.hash}`;
+    const refreshMarker = `proxy_refresh=${Date.now()}`;
+    const freshUrl = `https://chatgpt.com${previousLocation.path}?${refreshMarker}${previousLocation.hash}`;
     try { await cdp.send('Page.navigate', { url: freshUrl }); } catch {}
-    const documentReady = await waitForChatGPTDocument(15000);
+    const documentReady = await waitForChatGPTDocument(15000, null, refreshMarker);
     if (!documentReady) {
       console.log('  ⚠️ ChatGPT did not finish its single navigation.');
       console.log(`     Diagnostics: ${diagnosticsPath}\n`);
@@ -1219,7 +1525,7 @@ async function main() {
       return null;
     }
 
-    recoveryState = 'verifying';
+    setRecoveryState('verifying');
     const verification = await verifyStableSession();
     const state = verification.state || {};
     trace('session_verification', {
@@ -1227,16 +1533,21 @@ async function main() {
       loggedIn: !!state.loggedIn,
       status: state.status || 0,
       country: state.country || null,
+      challenge: !!state.challenge,
+      snippet: state.snippet || null,
       routeCountry: route.country,
       error: state.error || null
-    });
+    }, `🔍 after refresh: loggedIn=${!!state.loggedIn} me=${state.status || 0} country=${state.country || '?'}${state.challenge ? ' challenge=yes' : ''}`);
 
     if (verification.ok) {
       return acceptRecovery(state, route, 'single_navigation');
     }
 
-    const detail = !state.loggedIn ? 'session endpoint is logged out' :
-      `country endpoint returned HTTP ${state.status || 0}`;
+    const detail = state.challenge
+      ? `Cloudflare returned a challenge page (session ${state.sessionStatus || '?'}, me ${state.status || '?'})`
+      : !state.loggedIn
+        ? `session endpoint is logged out (HTTP ${state.sessionStatus || 0})`
+        : `country endpoint returned HTTP ${state.status || 0}`;
     console.log(`  ⚠️ First refresh completed, but ${detail}.`);
     console.log(`     Diagnostics: ${diagnosticsPath}\n`);
     trace('recovery_failed', { stage: 'session_verification', detail });
@@ -1281,7 +1592,7 @@ async function main() {
     })().finally(async () => {
       try { await cdp.send('Network.setCacheDisabled', { cacheDisabled: false }); } catch {}
       autoReloadInProgress = false;
-      recoveryState = 'idle';
+      setRecoveryState('idle');
       recoveryPromise = null;
     });
 
@@ -1307,8 +1618,11 @@ async function main() {
     last401At = now;
 
     const endpoint = url.replace(/^https?:\/\/[^/]+/, '');
-    console.log(`\n  ⚡ Detected ${status} on ${endpoint}`);
-    trace('auth_response_failure', { status, endpoint });
+    trace('auth_response_failure', {
+      status,
+      endpoint,
+      remoteIP: params.response?.remoteIPAddress || null
+    }, `⚡ auth failure ${status} on ${endpoint}`);
     void requestProxyRecovery(`${status} response`);
   });
 
@@ -1326,24 +1640,31 @@ async function main() {
     const now = Date.now();
     if (now - lastTransportFailureAt < 4000) return;
     lastTransportFailureAt = now;
-    console.log(`\n  ⚡ Transport failure detected: ${error}`);
     trace('transport_failure', {
       error,
       resourceType,
+      url: inFlight.get(params.requestId)?.url || null,
       blockedReason: params.blockedReason || null
-    });
+    }, `⚡ transport failure ${error} (${resourceType})`);
     void requestProxyRecovery(error.replace(/^net::/, ''));
   });
 
   // Background country monitor (backup layer + country change detection)
   const countryMonitor = setInterval(async () => {
-    if (!cdp.isAlive() || cleaning || awaitingInput || autoReloadInProgress) return;
+    if (!cdp.isAlive() || cleaning || autoReloadInProgress) return;
     try {
       const res = await cdp.send('Runtime.evaluate', {
         expression: `fetch('/backend-api/me',{credentials:'include',cache:'no-store'}).then(async r=>{if(r.ok){const d=await r.json().catch(()=>({}));return JSON.stringify({status:200,country:d.country||null,email:d.email||null});}return JSON.stringify({status:r.status});}).catch(e=>JSON.stringify({status:0,error:e.message}))`,
         awaitPromise: true, returnByValue: true, timeout: 8000
       });
       const data = JSON.parse(res.result?.value || '{}');
+      trace('country_monitor', {
+        status: data.status,
+        country: data.country || null,
+        knownCountry: lastKnownCountry,
+        routeCountry: activeRouteCountry,
+        error: data.error || null
+      });
 
       if (data.status === 401 || data.status === 403) {
         void requestProxyRecovery(`${data.status} from country check`);
@@ -1353,27 +1674,48 @@ async function main() {
       if (data.country) {
         if (lastKnownCountry === null) {
           lastKnownCountry = data.country;
-          console.log(`  🌍 Current country: ${data.country} (${currencyForCountry(data.country)})`);
+          trace('country_established', { country: data.country },
+            `🌍 ChatGPT country: ${data.country} (${currencyForCountry(data.country)})`);
         } else if (lastKnownCountry !== data.country) {
-          console.log(`\n  🔄 Country changed: ${lastKnownCountry} → ${data.country} (${currencyForCountry(data.country)})`);
-          console.log('  ✅ ChatGPT now using new region. Ready for checkout.\n');
           trace('country_changed_without_recovery', {
             from: lastKnownCountry,
             to: data.country
-          });
+          }, `🔄 ChatGPT country ${lastKnownCountry} → ${data.country} (${currencyForCountry(data.country)})`);
           lastKnownCountry = data.country;
           handled = false;
           lastOfferSeen = false;
         }
       }
-    } catch {}
+    } catch (e) {
+      trace('country_monitor_error', { error: e.message });
+    }
   }, 4000);
+
+  // Live snapshot so the exit IP, ChatGPT's region, and the page state can be
+  // compared at a glance while a switch is happening.
+  const snapshotMonitor = setInterval(async () => {
+    if (!cdp.isAlive() || cleaning || autoReloadInProgress) return;
+    const route = await probeExitCountry(cdp);
+    const location = await currentPageLocation();
+    trace('snapshot', {
+      exitCountry: route.ok ? route.country : null,
+      exitProvider: route.provider || null,
+      exitProbeMs: route.elapsedMs,
+      chatgptCountry: lastKnownCountry,
+      routeCountryUsedForCheckout: activeRouteCountry,
+      cookieFingerprint: fingerprint(sessionToken),
+      recoveryState,
+      page: `${location.path}${location.hash}`,
+      pausedRequests: pausedRequests.size
+    }, `📡 exit=${route.ok ? route.country : '?'} chatgpt=${lastKnownCountry || '?'} cookie=${fingerprint(sessionToken)} page=${location.path}${location.hash} state=${recoveryState}`);
+  }, 10000);
 
   console.log('  ' + '─'.repeat(56));
   console.log('  🕵️  MONITORING MODE ACTIVE');
   console.log('  📍 Watching for trial offers OR pricing pages');
   console.log('  ⚡ Proxy recovery state machine: idle');
-  console.log('  🌍 Country change monitor (every 4s as backup)');
+  console.log('  🌍 Country monitor 4s | exit-IP snapshot 10s');
+  console.log(`  🧾 Trace: ${TRACE_ENABLED ? 'every request, response, cookie, and page event' : 'off'}`);
   console.log('  💡 Press Ctrl+C to quit at any time');
   console.log('  ' + '─'.repeat(56) + '\n');
 
@@ -1469,6 +1811,7 @@ async function main() {
   clearInterval(keepAlive);
   clearInterval(cookieSyncMonitor);
   clearInterval(countryMonitor);
+  clearInterval(snapshotMonitor);
   if (typeof leakDetector !== 'undefined') clearInterval(leakDetector);
   if (typeof statsReporter !== 'undefined') clearInterval(statsReporter);
   try { ws.close(); } catch {}
