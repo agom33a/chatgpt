@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v8.2 - Upgrade entry aware)
+ *   🎯 ChatGPT Manual Browser Smart (v8.3 - No reload loops)
+ *
+ *   v8.3 additions:
+ *     - One reload per signed-out episode, never a loop
+ *     - Recognises the "choose an account" screen and explains it
+ *     - Offers the pay link directly from the signed-out page
+ *     - Stops reporting navigation-canceled interceptions as errors
  *
  *   v8.2 additions:
  *     - Recognises the plain "Upgrade" button and sidebar span as "no trial"
@@ -858,7 +864,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v8.2 - Upgrade Entry Aware)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v8.3 - No Reload Loops)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -1074,6 +1080,12 @@ async function main() {
   // Anonymous-render state, declared before the network listeners that use it.
   let anonymousRenderSeenAt = 0;
   let anonymousRepairPromise = null;
+  // One reload attempt per episode. ChatGPT sometimes requires the account to be
+  // re-selected after a region change, and no amount of reloading fixes that.
+  let anonymousRepairAttempts = 0;
+  let anonymousNoticeShown = false;
+  let anonymousOfferPending = false;
+  // Hard floor between reloads, so even a flapping region cannot cause a loop.
   let lastAnonymousRepairAt = 0;
   // Repairs only run once the monitoring loop owns the page; during startup the
   // initial navigation is still settling.
@@ -1388,9 +1400,11 @@ async function main() {
     } catch (e) {
       clearTimeout(rescueTimer);
       pausedRequests.delete(requestId);
-      errorCounter++;
-      trace('fetch_intercept_error', { requestId, url, error: e.message },
-        `❌ intercept error #${errorCounter} ${short} — ${e.message}`);
+      // A navigation cancels paused requests, which invalidates their ids.
+      const benign = /Invalid InterceptionId/i.test(e.message);
+      if (!benign) errorCounter++;
+      trace('fetch_intercept_error', { requestId, url, error: e.message, benign },
+        benign ? null : `❌ intercept error #${errorCounter} ${short} — ${e.message}`);
       try { await cdp.send('Fetch.continueRequest', { requestId }); }
       catch { try { await cdp.send('Fetch.failRequest', { requestId, errorReason: 'Failed' }); } catch {} }
     }
@@ -1776,12 +1790,30 @@ async function main() {
   // After an IP change ChatGPT sometimes renders the page as a signed-out
   // visitor even though the session is still valid, which is why a second manual
   // refresh used to fix it. One reload with the valid cookie restores it.
+  async function detectAccountChooser() {
+    try {
+      const res = await cdp.send('Runtime.evaluate', {
+        expression: `(() => {
+          const body = (document.body?.innerText || '').toLowerCase();
+          return body.includes('choose an account to continue') ||
+            (body.includes('welcome back') && body.includes('log in to another account'));
+        })()`,
+        returnByValue: true, timeout: 5000
+      });
+      return !!res.result?.value;
+    } catch {
+      return false;
+    }
+  }
+
   function repairAnonymousRender() {
     if (cleaning || !cdp.isAlive() || autoReloadInProgress) return Promise.resolve(false);
     if (anonymousRepairPromise) return anonymousRepairPromise;
-    if (Date.now() - lastAnonymousRepairAt < 20000) return Promise.resolve(false);
+    if (anonymousRepairAttempts >= 1) return Promise.resolve(false);
+    if (Date.now() - lastAnonymousRepairAt < 60000) return Promise.resolve(false);
 
     anonymousRepairPromise = (async () => {
+      anonymousRepairAttempts++;
       lastAnonymousRepairAt = Date.now();
       const session = await probeChatGPTSession();
       if (!session.loggedIn) {
@@ -1836,12 +1868,30 @@ async function main() {
         ? '⚠️ the page is still rendering as signed out after the reload'
         : '✅ signed-in view restored');
 
-      if (stillAnonymous) {
-        console.log('  ⚠️ ChatGPT is still showing the signed-out view; the pay link can still be generated.\n');
-      } else {
+      if (!stillAnonymous) {
         console.log(`  ✅ Signed-in view restored${after.country ? ` (${after.country})` : ''}.\n`);
+        anonymousRepairAttempts = 0;
+        anonymousNoticeShown = false;
+        return true;
       }
-      return !stillAnonymous;
+
+      // No further reloads: ChatGPT is deliberately asking for the account to be
+      // picked again, and the pay link does not need the page at all.
+      const chooser = await detectAccountChooser();
+      if (!anonymousNoticeShown) {
+        anonymousNoticeShown = true;
+        console.log(chooser
+          ? '  ℹ️ ChatGPT is asking you to pick the account again after the region change.'
+          : '  ℹ️ ChatGPT is keeping the signed-out view for this region.');
+        console.log('     Your session is still valid, so the pay link works regardless.');
+        console.log('     Click your account in the page if you also want the UI signed in.\n');
+      }
+      trace('anonymous_render_gave_up', { accountChooser: chooser, country: after.country || null });
+
+      // Offer the link straight away: the signed-out page never shows an
+      // Upgrade control, so page-based detection cannot ask on its own.
+      anonymousOfferPending = true;
+      return false;
     })().finally(() => {
       anonymousRepairPromise = null;
     });
@@ -2065,6 +2115,8 @@ async function main() {
     const oldCountry = lastKnownCountry;
     lastKnownCountry = state.country;
     activeRouteCountry = route.country;
+    anonymousRepairAttempts = 0;
+    anonymousNoticeShown = false;
     const matchesRoute = state.country === route.country;
 
     console.log(`  ✅ Session active${state.email ? `: ${state.email}` : ''}`);
@@ -2207,6 +2259,8 @@ async function main() {
           lastKnownCountry = data.country;
           handled = false;
           lastOfferSeen = false;
+          anonymousRepairAttempts = 0;
+          anonymousNoticeShown = false;
         }
       }
     } catch (e) {
@@ -2253,7 +2307,15 @@ async function main() {
       continue;
     }
 
-    const offer = await detectOffer(cdp);
+    // A signed-out page never renders an Upgrade control, so the pending offer
+    // raised by the anonymous-render handler stands in for page detection.
+    let offer;
+    if (anonymousOfferPending) {
+      anonymousOfferPending = false;
+      offer = { found: true, type: 'noTrial', buttonLabel: 'signed-out page', surface: 'signed-out-page' };
+    } else {
+      offer = await detectOffer(cdp);
+    }
     if (!offer.found) { lastOfferSeen = false; continue; }
 
     lastOfferSeen = true;
@@ -2269,7 +2331,9 @@ async function main() {
     } else {
       // noTrial: user is on pricing page but no trial available
       const btnLabel = offer.buttonLabel || 'Upgrade';
-      const surfaceLabel = offer.surface === 'upgrade-entry'
+      const surfaceLabel = offer.surface === 'signed-out-page'
+        ? 'signed-out page (session still valid)'
+        : offer.surface === 'upgrade-entry'
         ? 'upgrade button'
         : offer.surface === 'plan-dialog'
           ? 'plan dialog'
