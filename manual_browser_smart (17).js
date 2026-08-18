@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v8.1 - Signed-in view repair)
+ *   🎯 ChatGPT Manual Browser Smart (v8.2 - Upgrade entry aware)
+ *
+ *   v8.2 additions:
+ *     - Recognises the plain "Upgrade" button and sidebar span as "no trial"
+ *     - Reports which surface the upgrade control was found on
  *
  *   v8.1 additions:
  *     - Detects the signed-out (backend-anon) render after an IP change
@@ -528,36 +532,39 @@ const OFFER_DETECTION_EXPRESSION = `(() => {
       .find(el => visible(el) && trialLabels.includes(text(el).toLowerCase()));
     if (freeBtn) return JSON.stringify({found:true, type:'trial', mode:'free', buttonLabel: text(freeBtn)});
 
-    // Priority 2: an upgrade action, which means no trial is being offered.
+    // Priority 2: any upgrade control. Its presence without a trial offer means
+    // no free trial is available, which is exactly when the pay link is wanted.
+    // The plain "Upgrade" entry points are rendered as a <button> in the top bar
+    // and as a clickable <span> beside the account in the sidebar.
     const upgradeLabels = [
-      'upgrade to plus', 'get plus', 'rejoin plus', 'subscribe to plus',
-      'reactivate plus', 'go plus', 'upgrade to chatgpt plus', 'resubscribe to plus'
+      'upgrade', 'upgrade plan', 'upgrade to plus', 'upgrade to chatgpt plus',
+      'get plus', 'rejoin plus', 'subscribe to plus', 'resubscribe to plus',
+      'reactivate plus', 'go plus'
     ];
-    const upgradeEl = Array.from(document.querySelectorAll('button, a[role="button"], a[href*="checkout"]'))
-      .find(el => visible(el) && upgradeLabels.includes(text(el).toLowerCase()));
+    const upgradeEl = Array.from(document.querySelectorAll('button, a, span'))
+      .find(el => visible(el) &&
+        el.children.length <= 1 && // allows a single icon child, rejects wrappers
+        upgradeLabels.includes(text(el).toLowerCase()));
     if (!upgradeEl) return JSON.stringify({found:false});
 
-    // The sidebar always shows a generic upgrade entry point for free accounts,
-    // so a plan surface must be present before offering to build a pay link.
     const urlSuggestsPricing = location.hash.includes('pricing') ||
       location.pathname.includes('pricing') ||
       location.search.includes('promo_campaign');
-
     const inDialog = !!upgradeEl.closest('[role="dialog"], dialog');
     const bodyText = text(document.body).toLowerCase();
     const mentionsPlusPlan = bodyText.includes('chatgpt plus') || bodyText.includes('your ai assistant');
     const showsMonthlyPrice = /\\/\\s*month|per month|\\/mo\\b/i.test(bodyText);
-    const planSurface = inDialog || (mentionsPlusPlan && showsMonthlyPrice);
 
-    if (!urlSuggestsPricing && !planSurface) {
-      return JSON.stringify({found:false, reason:'upgrade button without a plan surface'});
-    }
+    const surface = urlSuggestsPricing ? 'pricing-url'
+      : inDialog ? 'plan-dialog'
+      : (mentionsPlusPlan && showsMonthlyPrice) ? 'plan-cards'
+      : 'upgrade-entry';
 
     return JSON.stringify({
       found: true,
       type: 'noTrial',
       buttonLabel: text(upgradeEl),
-      surface: urlSuggestsPricing ? 'pricing-url' : (inDialog ? 'plan-dialog' : 'plan-cards')
+      surface
     });
   } catch (e) { return JSON.stringify({found:false, err:e.message}); }
 })()`;
@@ -851,7 +858,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v8.1 - Signed-In View Repair)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v8.2 - Upgrade Entry Aware)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -2262,7 +2269,14 @@ async function main() {
     } else {
       // noTrial: user is on pricing page but no trial available
       const btnLabel = offer.buttonLabel || 'Upgrade';
-      console.log(`\n  💳 Plan surface detected (${offer.surface || 'unknown'}) — "${btnLabel}" visible, so no free trial is offered`);
+      const surfaceLabel = offer.surface === 'upgrade-entry'
+        ? 'upgrade button'
+        : offer.surface === 'plan-dialog'
+          ? 'plan dialog'
+          : offer.surface === 'plan-cards'
+            ? 'plan cards'
+            : 'pricing page';
+      console.log(`\n  💳 "${btnLabel}" visible on the ${surfaceLabel}, so no free trial is offered`);
       awaitingInput = true;
       var rawAnswer = await ask('  Generate direct Plus pay link now?\n  Type "y" for YES, or press Enter for NO: ');
       awaitingInput = false;
