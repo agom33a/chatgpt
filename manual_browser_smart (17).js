@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v7.7 - Quieter and safer)
+ *   🎯 ChatGPT Manual Browser Smart (v7.8 - Slow route tolerant)
+ *
+ *   v7.8 additions:
+ *     - Absorbs the slow first document of a new proxy in a background tab
+ *     - Retries the visible load a few times with growing waits
+ *     - Reports Page.navigate errors immediately instead of waiting them out
+ *     - Stops polling the session while the tab holds an error page
  *
  *   v7.7 additions:
  *     - Stops recreating the duplicate session cookie it had just removed
@@ -777,7 +783,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v7.7 - Quieter And Safer)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v7.8 - Slow Route Tolerant)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -985,6 +991,9 @@ async function main() {
 
   // Last session cookie value issued by the server, which wins over the jar.
   let serverSessionToken = null;
+  // Tracks whether the visible tab currently holds a real chatgpt.com document,
+  // so in-page polling is skipped on error/blank pages.
+  let pageIsChatGPT = false;
 
   // Once the server has issued a session cookie it is authoritative; the jar is
   // only consulted while no server cookie has been seen yet.
@@ -1148,8 +1157,12 @@ async function main() {
 
   cdp.on('Page.frameNavigated', params => {
     if (params.frame?.parentId) return;
+    let host = '';
+    try { host = new URL(params.frame?.url || '').hostname; } catch {}
+    pageIsChatGPT = host === 'chatgpt.com' && !params.frame?.unreachableUrl;
     trace('frame_navigated', {
       url: params.frame?.url,
+      host,
       status: params.frame?.unreachableUrl ? 'unreachable' : 'ok'
     }, `🧭 navigated ${shortenUrl(params.frame?.url || '')}`);
   });
@@ -1592,7 +1605,7 @@ async function main() {
     await ensureSessionCookiePresent(stage);
   }
 
-  async function warmUpChatGPTInBackground(routeCountry) {
+  async function warmUpChatGPTInBackground(routeCountry, timeoutMs = 30000) {
     let targetId = null;
     try {
       await ensureSessionCookiePresent('background warmup');
@@ -1618,7 +1631,7 @@ async function main() {
       await cdp.send('Page.navigate', {
         url: `https://chatgpt.com/?${warmupMarker}`
       }, sessionId);
-      const ready = await waitForChatGPTDocument(12000, sessionId, warmupMarker);
+      const ready = await waitForChatGPTDocument(timeoutMs, sessionId, warmupMarker);
       const state = ready ? await probeChatGPTSession(sessionId) : { status: 0 };
       trace('background_warmup', {
         ready,
@@ -1626,7 +1639,7 @@ async function main() {
         status: state.status || 0,
         country: state.country || null,
         routeCountry
-      });
+      }, `🔥 background warm-up ${ready ? 'loaded' : 'did not load'} (loggedIn=${!!state.loggedIn} me=${state.status || 0})`);
       return { ready, state };
     } catch (e) {
       trace('background_warmup_failed', { error: e.message, routeCountry });
@@ -1670,26 +1683,56 @@ async function main() {
     return !!probe.loggedIn && probe.status === 200;
   }
 
-  async function navigateOnceAndVerify(route, targetLocation) {
+  // The first document through a freshly selected proxy can take 20s or more,
+  // and sometimes times out entirely, so a few escalating attempts are allowed.
+  // This is still driven by verified route health, not blind reloading.
+  async function navigateOnceAndVerify(route, targetLocation, attempts = 3) {
     setRecoveryState('single-navigation');
     const page = `${targetLocation.path}${targetLocation.hash}`;
-    trace('single_navigation_started', { routeCountry: route.country, page },
-      `🔄 refreshing ChatGPT once on ${page}`);
+    let documentReady = false;
+    let refreshMarker = '';
 
-    try { await cdp.send('Page.stopLoading'); } catch {}
-    try { await cdp.send('Network.setCacheDisabled', { cacheDisabled: true }); } catch {}
-    await releaseOldRegionState('before_navigation');
+    for (let attempt = 1; attempt <= attempts && !documentReady; attempt++) {
+      refreshMarker = `proxy_refresh=${Date.now()}`;
+      const freshUrl = `https://chatgpt.com${targetLocation.path}?${refreshMarker}${targetLocation.hash}`;
+      trace('navigation_attempt', { attempt, attempts, routeCountry: route.country, url: freshUrl },
+        `🔄 loading ChatGPT on ${page} (attempt ${attempt}/${attempts})`);
 
-    // Reloading the same path/hash lets the pricing view recompute its plans
-    // for the new region instead of restoring a cached view.
-    const refreshMarker = `proxy_refresh=${Date.now()}`;
-    const freshUrl = `https://chatgpt.com${targetLocation.path}?${refreshMarker}${targetLocation.hash}`;
-    try { await cdp.send('Page.navigate', { url: freshUrl }); } catch {}
-    const documentReady = await waitForChatGPTDocument(20000, null, refreshMarker);
+      try { await cdp.send('Page.stopLoading'); } catch {}
+      if (attempt > 1) {
+        // Chrome's own error page retries on its own timer; moving to a blank
+        // page first cancels that and frees the stalled sockets.
+        try { await cdp.send('Page.navigate', { url: 'about:blank' }); } catch {}
+        await sleep(400);
+        try { await cdp.send('Network.closeIdleConnections'); } catch {}
+      }
+      try { await cdp.send('Network.setCacheDisabled', { cacheDisabled: true }); } catch {}
+      await releaseOldRegionState(attempt === 1 ? 'before_navigation' : `before_retry_${attempt}`);
+
+      let navigationError = null;
+      try {
+        const result = await cdp.send('Page.navigate', { url: freshUrl }, null, 60000);
+        navigationError = result?.errorText || null;
+      } catch (e) {
+        navigationError = e.message;
+      }
+      if (navigationError) {
+        trace('navigation_error', { attempt, error: navigationError },
+          `⚠️ navigation reported ${navigationError}`);
+      }
+
+      documentReady = await waitForChatGPTDocument(20000 + (attempt - 1) * 10000, null, refreshMarker);
+      if (!documentReady) {
+        trace('navigation_timed_out', { attempt, routeCountry: route.country },
+          `⚠️ attempt ${attempt} did not finish loading`);
+      }
+    }
+
     if (!documentReady) {
-      console.log('  ⚠️ ChatGPT did not finish its single navigation.');
+      console.log(`  ⚠️ ChatGPT never finished loading through this route after ${attempts} attempts.`);
+      console.log('     The proxy answers other sites, so it is likely throttling chatgpt.com.');
       console.log(`     Diagnostics: ${diagnosticsPath}\n`);
-      trace('recovery_failed', { stage: 'document_not_ready', routeCountry: route.country, url: freshUrl });
+      trace('recovery_failed', { stage: 'document_not_ready', routeCountry: route.country, attempts });
       return null;
     }
 
@@ -1763,7 +1806,15 @@ async function main() {
     const pageBefore = await currentPageLocation();
     if (!pageBefore.onChatGPT) {
       trace('recovery_skipping_precheck', { reason: 'page is not a chatgpt.com document' },
-        '↷ page is not on chatgpt.com; going straight to one navigation');
+        '↷ page is not on chatgpt.com; warming the route before reloading it');
+
+      // Absorb the slow first request through the new proxy in a background tab
+      // so the visible tab does not sit on an error page while it happens.
+      setRecoveryState('releasing-old-region');
+      await releaseOldRegionState('before_warmup');
+      setRecoveryState('background-warmup');
+      await warmUpChatGPTInBackground(route.country, 40000);
+      await ensureSessionCookiePresent('after warmup');
       return navigateOnceAndVerify(route, { path: '/', hash: '' });
     }
 
@@ -1911,7 +1962,7 @@ async function main() {
 
   // Background country monitor (backup layer + country change detection)
   const countryMonitor = setInterval(async () => {
-    if (!cdp.isAlive() || cleaning || autoReloadInProgress) return;
+    if (!cdp.isAlive() || cleaning || autoReloadInProgress || !pageIsChatGPT) return;
     if (!inActivePeriod() && ++countryTick % 2) return;
     try {
       const res = await cdp.send('Runtime.evaluate', {
