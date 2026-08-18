@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v8.0 - Progress driven)
+ *   🎯 ChatGPT Manual Browser Smart (v8.1 - Signed-in view repair)
+ *
+ *   v8.1 additions:
+ *     - Detects the signed-out (backend-anon) render after an IP change
+ *     - Reloads once to restore the signed-in view when the session is valid
+ *     - Distinguishes a real sign-out and says what to do about it
  *
  *   v8.0 additions:
  *     - Waits on observed network progress instead of fixed deadlines
@@ -846,7 +851,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v8.0 - Progress Driven)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v8.1 - Signed-In View Repair)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -1059,6 +1064,14 @@ async function main() {
   // Tracks whether the visible tab currently holds a real chatgpt.com document,
   // so in-page polling is skipped on error/blank pages.
   let pageIsChatGPT = false;
+  // Anonymous-render state, declared before the network listeners that use it.
+  let anonymousRenderSeenAt = 0;
+  let anonymousRepairPromise = null;
+  let lastAnonymousRepairAt = 0;
+  // Repairs only run once the monitoring loop owns the page; during startup the
+  // initial navigation is still settling.
+  let monitoringReady = false;
+
   // Timestamp of the last ChatGPT network event. Waiting logic uses this so a
   // slow but progressing connection is never abandoned on a clock alone.
   let lastChatGPTActivityAt = Date.now();
@@ -1127,6 +1140,14 @@ async function main() {
     const url = params.request?.url || '';
     const type = params.type || 'Other';
     noteChatGPTActivity(url);
+
+    // ChatGPT only calls /backend-anon/ when the rendered page believes nobody
+    // is signed in. Our injected API calls can still succeed at the same time,
+    // so this is the only reliable sign that the page itself went anonymous.
+    if (/chatgpt\.com\/backend-anon\//i.test(url)) {
+      anonymousRenderSeenAt = Date.now();
+      if (monitoringReady) void repairAnonymousRender();
+    }
     inFlight.set(params.requestId, {
       url,
       type,
@@ -1745,6 +1766,82 @@ async function main() {
     }
   }
 
+  // After an IP change ChatGPT sometimes renders the page as a signed-out
+  // visitor even though the session is still valid, which is why a second manual
+  // refresh used to fix it. One reload with the valid cookie restores it.
+  function repairAnonymousRender() {
+    if (cleaning || !cdp.isAlive() || autoReloadInProgress) return Promise.resolve(false);
+    if (anonymousRepairPromise) return anonymousRepairPromise;
+    if (Date.now() - lastAnonymousRepairAt < 20000) return Promise.resolve(false);
+
+    anonymousRepairPromise = (async () => {
+      lastAnonymousRepairAt = Date.now();
+      const session = await probeChatGPTSession();
+      if (!session.loggedIn) {
+        const cause = session.challenge
+          ? 'Cloudflare returned a challenge instead of the session'
+          : session.sessionStatus === 200
+            ? 'ChatGPT reports no signed-in user, so the session token is no longer accepted'
+            : `the session endpoint returned HTTP ${session.sessionStatus || 0}`;
+        console.log('\n  👤 The page is signed out and reloading will not help.');
+        console.log(`     Reason: ${cause}.`);
+        if (!session.challenge && session.sessionStatus === 200) {
+          console.log('     Refresh session_api.json with a new sessionToken to continue.\n');
+        } else {
+          console.log('');
+        }
+        trace('anonymous_render_session_invalid', {
+          sessionStatus: session.sessionStatus || 0,
+          meStatus: session.status || 0,
+          challenge: !!session.challenge,
+          cause
+        }, `⚠️ signed-out page: ${cause}`);
+        return false;
+      }
+
+      console.log('\n  👤 ChatGPT rendered the page as a signed-out visitor, but the session is still valid.');
+      console.log('  🔄 Reloading once to restore the signed-in view...');
+      trace('anonymous_render_repair_started', { country: session.country || null });
+
+      cancelActiveQuestion();
+      handled = false;
+      lastOfferSeen = false;
+
+      const marker = `session_repair=${Date.now()}`;
+      try { await cdp.send('Page.stopLoading'); } catch {}
+      await ensureSessionCookiePresent('anonymous render repair');
+      try { await cdp.send('Page.navigate', { url: `https://chatgpt.com/?${marker}` }); } catch {}
+
+      const ready = await waitForChatGPTDocument(8000, null, marker);
+      const beforeCheck = Date.now();
+      // Give the restored page a moment; if it is signed in again it will not
+      // touch /backend-anon/ any more.
+      await sleep(4000);
+      const stillAnonymous = anonymousRenderSeenAt > beforeCheck;
+      const after = await probeChatGPTSession();
+
+      trace('anonymous_render_repair_result', {
+        documentReady: ready,
+        stillAnonymous,
+        loggedIn: !!after.loggedIn,
+        country: after.country || null
+      }, stillAnonymous
+        ? '⚠️ the page is still rendering as signed out after the reload'
+        : '✅ signed-in view restored');
+
+      if (stillAnonymous) {
+        console.log('  ⚠️ ChatGPT is still showing the signed-out view; the pay link can still be generated.\n');
+      } else {
+        console.log(`  ✅ Signed-in view restored${after.country ? ` (${after.country})` : ''}.\n`);
+      }
+      return !stillAnonymous;
+    })().finally(() => {
+      anonymousRepairPromise = null;
+    });
+
+    return anonymousRepairPromise;
+  }
+
   // Guarantees the visible tab is a working chatgpt.com document before any
   // checkout request, because relative fetches fail on error/blank pages.
   async function ensureChatGPTPageReady() {
@@ -2130,6 +2227,7 @@ async function main() {
     }, `📡 exit=${route.ok ? route.country : '?'} chatgpt=${lastKnownCountry || '?'} cookie=${fingerprint(sessionToken)} page=${location.path}${location.hash} state=${recoveryState}`);
   }, 10000);
 
+  monitoringReady = true;
   console.log('  ' + '─'.repeat(56));
   console.log('  🕵️  MONITORING MODE ACTIVE');
   console.log('  📍 Watching for trial offers OR upgrade/plan surfaces');
