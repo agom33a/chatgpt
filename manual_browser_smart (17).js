@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 /**
  * ════════════════════════════════════════════════════════════════
- *   🎯 ChatGPT Manual Browser Smart (v8.4 - Session re-establishment)
+ *   🎯 ChatGPT Manual Browser Smart (v8.5 - Fresh cookie, warm route)
+ *
+ *   v8.5 additions:
+ *     - Never replaces a session cookie the browser already sent, because
+ *       ChatGPT rotates the token per response and a spent token reads as
+ *       signed out (this was the real cause of the signed-out page)
+ *     - Watches the exit IP every 5s and prepares the new route immediately:
+ *       session refresh plus a background warm-up before the user reloads
+ *     - Restores the _account cookie only when it is actually missing
+ *     - Reports how many requests still needed header injection
  *
  *   v8.4 additions:
  *     - Refreshes the session for the new IP the way ChatGPT's client does
@@ -869,7 +878,7 @@ function parseSessionTokenFromSetCookie(headerValue) {
 
 async function main() {
   console.log('\n' + '='.repeat(60));
-  console.log('  🎯 ChatGPT Manual Browser Smart (v8.4 - Session Re-establishment)');
+  console.log('  🎯 ChatGPT Manual Browser Smart (v8.5 - Fresh Cookie, Warm Route)');
   console.log('='.repeat(60) + '\n');
 
   const diagnosticsPath = path.join(os.tmpdir(), 'chatgpt_proxy_diagnostics.jsonl');
@@ -1345,6 +1354,7 @@ async function main() {
   // ⭐ v5.6 + v5.7: Track paused requests with auto-recovery + verbose debug
   const pausedRequests = new Map(); // requestId → { timer, url, startedAt }
   let requestCounter = 0;
+  let injectedCounter = 0;
   let successCounter = 0;
   let timeoutCounter = 0;
   let errorCounter = 0;
@@ -1359,6 +1369,13 @@ async function main() {
     const resourceType = params.resourceType || 'Other';
     requestCounter++;
 
+    // Does the browser already carry a usable session cookie on this request?
+    const cookieHeader = Object.entries(params.request?.headers || {})
+      .find(([name]) => name.toLowerCase() === 'cookie');
+    const browserSentSession = !!cookieHeader &&
+      new RegExp(`(?:^|;\\s*)${COOKIE_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=[^;]{20,}`)
+        .test(String(cookieHeader[1]));
+
     const quietIntercept = (isAsset(resourceType) && !TRACE_ASSETS) || isTelemetryUrl(url);
     {
       trace('fetch_intercepted', {
@@ -1366,9 +1383,13 @@ async function main() {
         method: params.request?.method,
         resourceType,
         url,
-        inject: shouldInject,
-        cookieFingerprint: shouldInject ? fingerprint(sessionToken) : null
-      }, quietIntercept ? null : `⇢ intercept ${params.request?.method || 'GET'} ${resourceType} ${short}${shouldInject ? ` inject=${fingerprint(sessionToken)}` : ' inject=no'}`);
+        inject: shouldInject && !browserSentSession,
+        browserSentSession,
+        cookieFingerprint: shouldInject && !browserSentSession ? fingerprint(sessionToken) : null
+      }, quietIntercept ? null : `⇢ intercept ${params.request?.method || 'GET'} ${resourceType} ${short}${
+        !shouldInject ? ' inject=no'
+        : browserSentSession ? ' cookie=browser'
+        : ` inject=${fingerprint(sessionToken)}`}`);
     }
 
     // Timeout timer
@@ -1382,7 +1403,11 @@ async function main() {
     pausedRequests.set(requestId, { timer: rescueTimer, url, startedAt: Date.now() });
 
     try {
-      if (!shouldInject) {
+      if (!shouldInject || browserSentSession) {
+        // Chrome's own cookie is always fresher than our snapshot. ChatGPT
+        // rotates the session token on nearly every response, so replacing a
+        // cookie the browser already sent would present a spent token and the
+        // server would answer as a signed-out visitor.
         await cdp.send('Fetch.continueRequest', { requestId });
       } else {
         const reqHeaders = params.request.headers || {};
@@ -1398,6 +1423,7 @@ async function main() {
         }
         if (!hadCookie) newHeaders.push({ name: 'Cookie', value: `${COOKIE_NAME}=${sessionToken}` });
         await cdp.send('Fetch.continueRequest', { requestId, headers: newHeaders });
+        injectedCounter++;
       }
       clearTimeout(rescueTimer);
       pausedRequests.delete(requestId);
@@ -1439,9 +1465,10 @@ async function main() {
       ok: successCounter,
       timeouts: timeoutCounter,
       errors: errorCounter,
+      injected: injectedCounter,
       pending: pausedRequests.size,
       inFlight: inFlight.size
-    }, `📊 requests ${requestCounter} total | ${successCounter} ok | ${timeoutCounter} timeout | ${errorCounter} error | ${pausedRequests.size} paused`);
+    }, `📊 requests ${requestCounter} total | ${successCounter} ok | ${injectedCounter} cookie-injected | ${timeoutCounter} timeout | ${errorCounter} error | ${pausedRequests.size} paused`);
   }, 15000);
 
   console.log('  ✅ Interceptor ready (request rescue: 8s, verbose logging on)\n');
@@ -1516,6 +1543,7 @@ async function main() {
   let lastInterestingAt = Date.now();
   let countryTick = 0;
   let snapshotTick = 0;
+  let lastExitCountry = null;
   const markActivity = () => { lastInterestingAt = Date.now(); };
   const inActivePeriod = () => Date.now() - lastInterestingAt < 60000;
   let recoveryPromise = null;
@@ -1836,7 +1864,12 @@ async function main() {
     // Restore the active-account cookie so the server stops asking which
     // account to use.
     let accountCookieSet = false;
-    if (refresh.account) {
+    let accountCookieExists = false;
+    try {
+      const jar = await cdp.send('Network.getCookies', { urls: ['https://chatgpt.com/'] });
+      accountCookieExists = (jar.cookies || []).some(c => c.name === '_account' && (c.value || '').length > 0);
+    } catch {}
+    if (refresh.account && !accountCookieExists) {
       try {
         const result = await cdp.send('Network.setCookie', {
           name: '_account',
@@ -1857,9 +1890,10 @@ async function main() {
       loggedIn: !!refresh.loggedIn,
       hasToken: !!refresh.hasToken,
       accountKnown: !!refresh.account,
+      accountCookieExists,
       accountCookieSet,
       error: refresh.error || null
-    }, `🔁 session refreshed for the new IP (${stage}): HTTP ${refresh.status || 0}${refresh.loggedIn ? ', signed in' : ''}${accountCookieSet ? ', active account restored' : ''}`);
+    }, `🔁 session refreshed for the new IP (${stage}): HTTP ${refresh.status || 0}${refresh.loggedIn ? ', signed in' : ''}${accountCookieSet ? ', active account restored' : accountCookieExists ? ', active account already set' : ''}`);
 
     return refresh;
   }
@@ -2358,6 +2392,22 @@ async function main() {
     if (!inActivePeriod() && ++snapshotTick % 2) return;
     const route = await probeExitCountry(cdp);
     const location = await currentPageLocation();
+
+    // The exit-IP probe notices a new region long before ChatGPT does, because
+    // it does not go through ChatGPT at all. Preparing the route now means the
+    // user's own refresh no longer pays for the first slow TLS handshake.
+    if (route.ok && lastExitCountry && route.country !== lastExitCountry) {
+      markActivity();
+      trace('exit_country_changed', { from: lastExitCountry, to: route.country },
+        `🌐 exit IP moved ${lastExitCountry} → ${route.country}; preparing the route`);
+      anonymousRepairAttempts = 0;
+      anonymousNoticeShown = false;
+      void (async () => {
+        await reestablishSessionForNewIp('exit ip change');
+        await warmUpChatGPTInBackground(route.country, 15000);
+      })();
+    }
+    if (route.ok) lastExitCountry = route.country;
     trace('snapshot', {
       exitCountry: route.ok ? route.country : null,
       exitProvider: route.provider || null,
@@ -2369,14 +2419,14 @@ async function main() {
       page: `${location.path}${location.hash}`,
       pausedRequests: pausedRequests.size
     }, `📡 exit=${route.ok ? route.country : '?'} chatgpt=${lastKnownCountry || '?'} cookie=${fingerprint(sessionToken)} page=${location.path}${location.hash} state=${recoveryState}`);
-  }, 10000);
+  }, 5000);
 
   monitoringReady = true;
   console.log('  ' + '─'.repeat(56));
   console.log('  🕵️  MONITORING MODE ACTIVE');
   console.log('  📍 Watching for trial offers OR upgrade/plan surfaces');
   console.log('  ⚡ Proxy recovery state machine: idle');
-  console.log('  🌍 Country monitor 4s | exit-IP snapshot 10s (halved while idle)');
+  console.log('  🌍 Country monitor 4s | exit-IP watch 5s (halved while idle)');
   console.log(`  🧾 Trace: ${TRACE_ENABLED ? 'every request, response, cookie, and page event' : 'off'}`);
   console.log('  💡 Press Ctrl+C to quit at any time');
   console.log('  ' + '─'.repeat(56) + '\n');
