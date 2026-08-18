@@ -102,6 +102,26 @@ test('an idle checkout times out and closes its API target', async () => {
   assert.ok(cdp.calls.some(call => call.method === 'Target.closeTarget'));
 });
 
+test('cancelling an active checkout closes its API target', async () => {
+  const cdp = createMockCdp('chrome-error://chromewebdata/', { hangCheckout: true });
+  const controller = new AbortController();
+  const checkout = runIsolatedCheckout({
+    cdp,
+    apiSession: { accessToken: 'token', account: { id: 'account-id' } },
+    currencyForCountry: () => 'PHP',
+    confirm: async detected => {
+      setTimeout(() => controller.abort(new Error('route changed')), 10);
+      return { confirmed: true, country: detected.country };
+    },
+    signal: controller.signal,
+    idleTimeoutMs: 500,
+    hardTimeoutMs: 1000
+  });
+  await assert.rejects(checkout, error =>
+    error.name === 'AbortError' && /route changed/.test(error.message));
+  assert.ok(cdp.calls.some(call => call.method === 'Target.closeTarget'));
+});
+
 test('time waiting for country confirmation does not consume the idle budget', async () => {
   const cdp = createMockCdp('about:blank');
   const result = await runIsolatedCheckout({
